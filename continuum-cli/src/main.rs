@@ -1,6 +1,7 @@
 //! Continuum CLI - Command-line interface for task management
 
 use std::io::{self, Read, Write};
+use std::os::fd::AsRawFd;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
@@ -11,6 +12,52 @@ use continuum_proto::{
 };
 use tokio_stream::StreamExt;
 use tonic::transport::Channel;
+
+// ============================================================================
+// Raw Terminal Mode
+// ============================================================================
+
+/// Guard that sets the terminal to raw mode and restores it on drop.
+struct RawModeGuard {
+    fd: i32,
+    original: libc::termios,
+}
+
+impl RawModeGuard {
+    /// Enter raw mode on stdin. Returns None if stdin is not a TTY.
+    fn enter() -> Option<Self> {
+        let fd = std::io::stdin().as_raw_fd();
+
+        // Check if stdin is a TTY
+        if unsafe { libc::isatty(fd) } != 1 {
+            return None;
+        }
+
+        // Get current settings
+        let mut original: libc::termios = unsafe { std::mem::zeroed() };
+        if unsafe { libc::tcgetattr(fd, &mut original) } != 0 {
+            return None;
+        }
+
+        // Create raw mode settings
+        let mut raw = original;
+        unsafe { libc::cfmakeraw(&mut raw) };
+
+        // Apply raw mode
+        if unsafe { libc::tcsetattr(fd, libc::TCSANOW, &raw) } != 0 {
+            return None;
+        }
+
+        Some(Self { fd, original })
+    }
+}
+
+impl Drop for RawModeGuard {
+    fn drop(&mut self) {
+        // Restore original settings
+        unsafe { libc::tcsetattr(self.fd, libc::TCSANOW, &self.original) };
+    }
+}
 
 /// Continuum - Distributed task execution
 #[derive(Parser)]
@@ -460,38 +507,65 @@ async fn cmd_attach(
         .context("StreamOutput failed")?
         .into_inner();
 
+    // Enter raw mode if interactive (disables local echo, lets remote PTY handle it)
+    let _raw_mode = if interactive && !is_terminal {
+        eprintln!("(Use ~. to detach)");
+        RawModeGuard::enter()
+    } else {
+        None
+    };
+
+    // Create detach channel
+    let (detach_tx, mut detach_rx) = tokio::sync::oneshot::channel::<()>();
+
     // If interactive and task is running, spawn stdin reader
     let stdin_handle = if interactive && !is_terminal {
         let task_id_clone = task_id.clone();
         let daemon_addr = _cli.daemon.clone();
 
         Some(tokio::spawn(async move {
-            if let Err(e) = forward_stdin(daemon_addr, task_id_clone).await {
-                eprintln!("stdin forwarding error: {}", e);
-            }
+            forward_stdin(daemon_addr, task_id_clone, detach_tx).await
         }))
     } else {
         None
     };
 
-    // Stream output
+    // Track if we detached vs task exited
+    let mut detached = false;
+
+    // Stream output, also watching for detach signal
     let mut stdout = io::stdout();
-    while let Some(result) = stream.next().await {
-        match result {
-            Ok(chunk) => {
-                stdout.write_all(&chunk.data)?;
-                stdout.flush()?;
-            }
-            Err(e) => {
-                if !no_follow {
-                    eprintln!("\nStream error: {}", e);
-                }
+    loop {
+        tokio::select! {
+            // Check for detach signal
+            _ = &mut detach_rx => {
+                detached = true;
                 break;
             }
-        }
 
-        if no_follow && is_terminal {
-            break;
+            // Stream output
+            result = stream.next() => {
+                match result {
+                    Some(Ok(chunk)) => {
+                        stdout.write_all(&chunk.data)?;
+                        stdout.flush()?;
+                    }
+                    Some(Err(e)) => {
+                        if !no_follow {
+                            eprintln!("\nStream error: {}", e);
+                        }
+                        break;
+                    }
+                    None => {
+                        // Stream ended (task exited)
+                        break;
+                    }
+                }
+
+                if no_follow && is_terminal {
+                    break;
+                }
+            }
         }
     }
 
@@ -500,30 +574,204 @@ async fn cmd_attach(
         handle.abort();
     }
 
-    Ok(())
-}
+    // Drop raw mode before printing exit message
+    drop(_raw_mode);
 
-async fn forward_stdin(daemon_addr: String, task_id: String) -> Result<()> {
-    let mut client = connect(&daemon_addr).await?;
-    let mut stdin = tokio::io::stdin();
+    // Show appropriate message
+    if interactive && !no_follow {
+        if detached {
+            eprintln!(
+                "\n[Detached - task still running. Reattach with: continuum attach -i {}]",
+                task_id
+            );
+        } else {
+            // Fetch final task status and show exit info
+            let get_request = GetTaskRequest {
+                task_id: task_id.clone(),
+            };
+            if let Ok(resp) = client.get_task(get_request).await {
+                if let Some(task) = resp.into_inner().task {
+                    let exit_msg = match TaskStatus::try_from(task.status) {
+                        Ok(TaskStatus::Completed) => {
+                            let code = task.exit_code.unwrap_or(0);
+                            if code == 0 {
+                                Some("Process exited normally".to_string())
+                            } else {
+                                Some(format!("Process exited with code {}", code))
+                            }
+                        }
+                        Ok(TaskStatus::Failed) => {
+                            if let Some(code) = task.exit_code {
+                                if code > 128 {
+                                    // Signal exit (128 + signal number)
+                                    let sig = code - 128;
+                                    let sig_name = match sig {
+                                        2 => "SIGINT",
+                                        9 => "SIGKILL",
+                                        15 => "SIGTERM",
+                                        _ => "",
+                                    };
+                                    if sig_name.is_empty() {
+                                        Some(format!("Process killed by signal {}", sig))
+                                    } else {
+                                        Some(format!("Process killed by {}", sig_name))
+                                    }
+                                } else {
+                                    Some(format!("Process exited with code {}", code))
+                                }
+                            } else if let Some(ref reason) = task.failure_reason {
+                                Some(format!("Process failed: {}", reason))
+                            } else {
+                                Some("Process failed".to_string())
+                            }
+                        }
+                        Ok(TaskStatus::Canceled) => Some("Process canceled".to_string()),
+                        _ => None,
+                    };
 
-    loop {
-        let mut buf = vec![0u8; 1024];
-        let n = tokio::io::AsyncReadExt::read(&mut stdin, &mut buf).await?;
-        if n == 0 {
-            break;
+                    if let Some(msg) = exit_msg {
+                        eprintln!("\n[{}]", msg);
+                        wait_for_keypress();
+                    }
+                }
+            }
         }
-        buf.truncate(n);
-
-        let request = SendInputRequest {
-            task_id: task_id.clone(),
-            data: buf,
-        };
-
-        client.send_input(request).await?;
     }
 
     Ok(())
+}
+
+/// Wait for a single keypress (used after task exits).
+fn wait_for_keypress() {
+    use std::os::fd::AsRawFd;
+
+    let fd = std::io::stdin().as_raw_fd();
+
+    // Check if stdin is a TTY
+    if unsafe { libc::isatty(fd) } != 1 {
+        return;
+    }
+
+    // Get current settings
+    let mut original: libc::termios = unsafe { std::mem::zeroed() };
+    if unsafe { libc::tcgetattr(fd, &mut original) } != 0 {
+        return;
+    }
+
+    // Create raw mode settings
+    let mut raw = original;
+    unsafe { libc::cfmakeraw(&mut raw) };
+
+    // Apply raw mode
+    if unsafe { libc::tcsetattr(fd, libc::TCSANOW, &raw) } != 0 {
+        return;
+    }
+
+    // Read a single byte
+    let mut buf = [0u8; 1];
+    let _ = std::io::stdin().read_exact(&mut buf);
+
+    // Restore original settings
+    unsafe { libc::tcsetattr(fd, libc::TCSANOW, &original) };
+}
+
+/// Result of stdin forwarding
+#[allow(dead_code)]
+enum StdinResult {
+    Eof,
+    Detach,
+    Error(anyhow::Error),
+}
+
+/// Escape sequence state machine (~. to detach)
+struct EscapeDetector {
+    saw_tilde: bool,
+}
+
+impl EscapeDetector {
+    fn new() -> Self {
+        Self { saw_tilde: false }
+    }
+
+    /// Process input bytes, returns (bytes_to_send, should_detach)
+    fn process(&mut self, input: &[u8]) -> (Vec<u8>, bool) {
+        let mut output = Vec::with_capacity(input.len());
+
+        for &byte in input {
+            if self.saw_tilde {
+                self.saw_tilde = false;
+                match byte {
+                    b'.' => {
+                        // ~. = detach
+                        return (output, true);
+                    }
+                    b'~' => {
+                        // ~~ = send single ~
+                        output.push(b'~');
+                    }
+                    _ => {
+                        // ~<other> = send both
+                        output.push(b'~');
+                        output.push(byte);
+                    }
+                }
+            } else if byte == b'~' {
+                // Potential start of escape sequence - hold it
+                self.saw_tilde = true;
+            } else {
+                output.push(byte);
+            }
+        }
+
+        (output, false)
+    }
+}
+
+async fn forward_stdin(
+    daemon_addr: String,
+    task_id: String,
+    detach_tx: tokio::sync::oneshot::Sender<()>,
+) -> StdinResult {
+    let mut client = match connect(&daemon_addr).await {
+        Ok(c) => c,
+        Err(e) => return StdinResult::Error(e),
+    };
+    let mut stdin = tokio::io::stdin();
+    let mut escape = EscapeDetector::new();
+
+    loop {
+        let mut buf = vec![0u8; 1024];
+        let n = match tokio::io::AsyncReadExt::read(&mut stdin, &mut buf).await {
+            Ok(0) => return StdinResult::Eof,
+            Ok(n) => n,
+            Err(e) => return StdinResult::Error(e.into()),
+        };
+        buf.truncate(n);
+
+        // Process through escape detector
+        let (data, should_detach) = escape.process(&buf);
+
+        if should_detach {
+            let _ = detach_tx.send(());
+            return StdinResult::Detach;
+        }
+
+        // Only send if there's data (escape sequence might consume all input)
+        if !data.is_empty() {
+            let request = SendInputRequest {
+                task_id: task_id.clone(),
+                data,
+            };
+
+            if let Err(e) = client.send_input(request).await {
+                // Ignore transport errors (task probably exited)
+                if !e.to_string().contains("transport error") {
+                    return StdinResult::Error(e.into());
+                }
+                return StdinResult::Eof;
+            }
+        }
+    }
 }
 
 async fn cmd_send(
