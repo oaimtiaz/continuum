@@ -1,0 +1,70 @@
+syntax = "proto3";
+package continuum.shim;
+
+// === Shim → Daemon messages ===
+
+message ShimToDaemon {
+  oneof msg {
+    Started started = 1;
+    Output output = 2;
+    Attention attention = 3;
+    Exited exited = 4;
+  }
+}
+
+message Started {
+  int32 pid = 1;
+  int32 pgid = 2;
+}
+
+message Output {
+  int64 timestamp_ms = 1;
+  bytes data = 2;
+}
+
+message Attention {
+  AttentionKind kind = 1;
+  int64 timestamp_ms = 2;
+  optional string context = 3;
+}
+
+enum AttentionKind {
+  ATTENTION_KIND_UNSPECIFIED = 0;
+  ATTENTION_KIND_MAYBE_NEEDS_INPUT = 1;
+  ATTENTION_KIND_NEEDS_INPUT = 2;
+  ATTENTION_KIND_STALLED = 3;
+  ATTENTION_KIND_ERROR = 4;
+}
+
+message Exited {
+  oneof status {
+    int32 code = 1;
+    int32 signal = 2;
+  }
+}
+
+// === Daemon → Shim messages ===
+
+message DaemonToShim {
+  oneof msg {
+    Stdin stdin = 1;
+    Signal signal = 2;
+    Resize resize = 3;
+    Shutdown shutdown = 4;
+  }
+}
+
+message Stdin {
+  bytes data = 1;
+}
+
+message Signal {
+  int32 signum = 1;
+}
+
+message Resize {
+  uint32 rows = 1;
+  uint32 cols = 2;
+}
+
+message Shutdown {}

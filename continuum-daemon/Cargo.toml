@@ -1,0 +1,23 @@
+[package]
+name = "continuum-daemon"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+continuum-core = { path = "../continuum-core" }
+continuum-proto = { path = "../continuum-proto" }
+continuum-shim-proto = { path = "../continuum-shim-proto" }
+tokio = { workspace = true }
+tokio-stream = { workspace = true }
+tonic = { workspace = true }
+prost = { workspace = true }
+bytes = "1.9"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+async-stream = "0.3"
+thiserror = { workspace = true }
+hostname = "0.4"
+tonic-reflection = "0.12"

@@ -1,0 +1,133 @@
+syntax = "proto3";
+
+package continuum;
+
+// ============================================================================
+// Enums
+// ============================================================================
+
+enum TaskStatus {
+  TASK_STATUS_UNSPECIFIED = 0;
+  TASK_STATUS_QUEUED = 1;
+  TASK_STATUS_RUNNING = 2;
+  TASK_STATUS_COMPLETED = 3;
+  TASK_STATUS_FAILED = 4;
+  TASK_STATUS_CANCELED = 5;
+}
+
+enum Stream {
+  STREAM_UNSPECIFIED = 0;
+  STREAM_PTY = 1;
+  STREAM_STDOUT = 2;
+  STREAM_STDERR = 3;
+}
+
+// ============================================================================
+// Core Types
+// ============================================================================
+
+// Stable client-facing representation of a task.
+// Maps from continuum_core::Task but only exposes what clients need.
+message TaskView {
+  string id = 1;
+  string name = 2;
+  repeated string cmd = 3;
+  string cwd = 4;
+  TaskStatus status = 5;
+  int64 created_at_ms = 6;
+  optional int64 started_at_ms = 7;
+  optional int64 ended_at_ms = 8;
+  optional int32 exit_code = 9;
+  optional string failure_reason = 10;
+  bool needs_input = 11;
+}
+
+// A chunk of output from a task's stdout/stderr/pty.
+message OutputChunk {
+  Stream stream = 1;
+  bytes data = 2;
+  int64 timestamp_ms = 3;
+}
+
+// ============================================================================
+// RPC Messages
+// ============================================================================
+
+// RunTask
+message RunTaskRequest {
+  string name = 1;
+  repeated string cmd = 2;
+  optional string cwd = 3;
+  map<string, string> env = 4;
+}
+
+message RunTaskResponse {
+  TaskView task = 1;
+}
+
+// ListTasks
+message ListTasksRequest {
+  optional TaskStatus status_filter = 1;
+  optional int32 limit = 2;
+}
+
+message ListTasksResponse {
+  repeated TaskView tasks = 1;
+}
+
+// GetTask
+message GetTaskRequest {
+  string task_id = 1;
+}
+
+message GetTaskResponse {
+  TaskView task = 1;
+}
+
+// SendInput
+message SendInputRequest {
+  string task_id = 1;
+  bytes data = 2;
+}
+
+message SendInputResponse {
+  // Empty on success; gRPC status codes for errors
+}
+
+// StreamOutput
+message StreamOutputRequest {
+  string task_id = 1;
+  optional int64 from_offset = 2;
+}
+
+// CancelTask
+message CancelTaskRequest {
+  string task_id = 1;
+  bool force = 2;  // true = SIGKILL, false = SIGTERM
+}
+
+message CancelTaskResponse {}
+
+// ============================================================================
+// Service
+// ============================================================================
+
+service Continuum {
+  // Create and start a new task
+  rpc RunTask(RunTaskRequest) returns (RunTaskResponse);
+
+  // List all tasks
+  rpc ListTasks(ListTasksRequest) returns (ListTasksResponse);
+
+  // Get a single task by ID
+  rpc GetTask(GetTaskRequest) returns (GetTaskResponse);
+
+  // Send input to a running task's stdin
+  rpc SendInput(SendInputRequest) returns (SendInputResponse);
+
+  // Stream output chunks from a task
+  rpc StreamOutput(StreamOutputRequest) returns (stream OutputChunk);
+
+  // Cancel a running task
+  rpc CancelTask(CancelTaskRequest) returns (CancelTaskResponse);
+}

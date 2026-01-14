@@ -1,0 +1,31 @@
+[package]
+name = "continuum-shim"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# Local crates
+continuum-pty = { path = "../continuum-pty" }
+continuum-shim-proto = { path = "../continuum-shim-proto" }
+
+# Async runtime
+tokio = { workspace = true, features = ["io-util", "net", "sync", "signal", "time"] }
+
+# CLI
+clap = { version = "4.5", features = ["derive"] }
+
+# Serialization
+prost = { workspace = true }
+
+# Error handling
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Utilities
+bytes = "1.9"
+regex = "1.11"
+libc = "0.2"
