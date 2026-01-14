@@ -213,7 +213,17 @@ async fn run(cli: Cli) -> Result<()> {
             file,
             ctrl_c,
             raw,
-        } => cmd_send(&mut client, task_id.clone(), data.clone(), file.clone(), *ctrl_c, *raw).await,
+        } => {
+            cmd_send(
+                &mut client,
+                task_id.clone(),
+                data.clone(),
+                file.clone(),
+                *ctrl_c,
+                *raw,
+            )
+            .await
+        }
 
         Commands::Cancel { task_id, force } => {
             cmd_cancel(&mut client, task_id.clone(), *force).await
@@ -309,18 +319,20 @@ async fn cmd_ls(
             eprintln!("No tasks found");
         } else {
             // Header
-            println!(
-                "{:<36}  {:<12}  {:<10}  {}",
-                "ID", "STATUS", "NAME", "CMD"
-            );
+            println!("{:<36}  {:<12}  {:<10}  {}", "ID", "STATUS", "NAME", "CMD");
             println!("{}", "-".repeat(80));
 
             for task in &response.tasks {
+                let display_status = if task.needs_input {
+                    "waiting"
+                } else {
+                    status_str(task.status)
+                };
                 let cmd_preview: String = task.cmd.join(" ").chars().take(30).collect();
                 println!(
                     "{:<36}  {:<12}  {:<10}  {}",
                     task.id,
-                    status_str(task.status),
+                    display_status,
                     truncate(&task.name, 10),
                     cmd_preview
                 );

@@ -5,12 +5,12 @@
 //! Then in another terminal:
 //! ./target/debug/continuum-shim --task-id test --connect /tmp/mock-daemon.sock -- bash
 
-use std::io::{Read, Write};
+use std::io::Read;
 use std::os::unix::net::UnixListener;
 use std::path::Path;
 
 use bytes::Bytes;
-use continuum_shim_proto::{ShimToDaemon, shim_to_daemon, AttentionKind};
+use continuum_shim_proto::{shim_to_daemon, AttentionKind, ShimToDaemon};
 use prost::Message;
 
 fn read_frame(stream: &mut std::os::unix::net::UnixStream) -> std::io::Result<Bytes> {
@@ -43,7 +43,10 @@ fn main() -> std::io::Result<()> {
 
     let listener = UnixListener::bind(socket_path)?;
     println!("Mock daemon listening on {}", socket_path.display());
-    println!("Run shim with: ./target/debug/continuum-shim --task-id test --connect {} -- <command>", socket_path.display());
+    println!(
+        "Run shim with: ./target/debug/continuum-shim --task-id test --connect {} -- <command>",
+        socket_path.display()
+    );
     println!();
 
     loop {
@@ -53,54 +56,48 @@ fn main() -> std::io::Result<()> {
 
         loop {
             match read_frame(&mut stream) {
-                Ok(frame) => {
-                    match ShimToDaemon::decode(frame) {
-                        Ok(msg) => {
-                            match msg.msg {
-                                Some(shim_to_daemon::Msg::Started(s)) => {
-                                    println!("📦 Started {{ pid: {}, pgid: {} }}", s.pid, s.pgid);
-                                }
-                                Some(shim_to_daemon::Msg::Output(o)) => {
-                                    let text = String::from_utf8_lossy(&o.data);
-                                    let preview: String = text.chars().take(100).collect();
-                                    println!(
-                                        "📤 Output {{ ts: {}, len: {}, data: {:?} }}",
-                                        o.timestamp_ms,
-                                        o.data.len(),
-                                        preview
-                                    );
-                                }
-                                Some(shim_to_daemon::Msg::Attention(a)) => {
-                                    println!(
-                                        "⚠️  Attention {{ kind: {}, ts: {}, context: {:?} }}",
-                                        attention_kind_name(a.kind),
-                                        a.timestamp_ms,
-                                        a.context
-                                    );
-                                }
-                                Some(shim_to_daemon::Msg::Exited(e)) => {
-                                    match e.status {
-                                        Some(continuum_shim_proto::exited::Status::Code(c)) => {
-                                            println!("🏁 Exited {{ code: {} }}", c);
-                                        }
-                                        Some(continuum_shim_proto::exited::Status::Signal(s)) => {
-                                            println!("🏁 Exited {{ signal: {} }}", s);
-                                        }
-                                        None => {
-                                            println!("🏁 Exited {{ status: None }}");
-                                        }
-                                    }
-                                }
-                                None => {
-                                    println!("❓ Empty message");
-                                }
+                Ok(frame) => match ShimToDaemon::decode(frame) {
+                    Ok(msg) => match msg.msg {
+                        Some(shim_to_daemon::Msg::Started(s)) => {
+                            println!("📦 Started {{ pid: {}, pgid: {} }}", s.pid, s.pgid);
+                        }
+                        Some(shim_to_daemon::Msg::Output(o)) => {
+                            let text = String::from_utf8_lossy(&o.data);
+                            let preview: String = text.chars().take(100).collect();
+                            println!(
+                                "📤 Output {{ ts: {}, len: {}, data: {:?} }}",
+                                o.timestamp_ms,
+                                o.data.len(),
+                                preview
+                            );
+                        }
+                        Some(shim_to_daemon::Msg::Attention(a)) => {
+                            println!(
+                                "⚠️  Attention {{ kind: {}, ts: {}, context: {:?} }}",
+                                attention_kind_name(a.kind),
+                                a.timestamp_ms,
+                                a.context
+                            );
+                        }
+                        Some(shim_to_daemon::Msg::Exited(e)) => match e.status {
+                            Some(continuum_shim_proto::exited::Status::Code(c)) => {
+                                println!("🏁 Exited {{ code: {} }}", c);
                             }
+                            Some(continuum_shim_proto::exited::Status::Signal(s)) => {
+                                println!("🏁 Exited {{ signal: {} }}", s);
+                            }
+                            None => {
+                                println!("🏁 Exited {{ status: None }}");
+                            }
+                        },
+                        None => {
+                            println!("❓ Empty message");
                         }
-                        Err(e) => {
-                            println!("❌ Decode error: {}", e);
-                        }
+                    },
+                    Err(e) => {
+                        println!("❌ Decode error: {}", e);
                     }
-                }
+                },
                 Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
                     println!("\n=== Connection closed ===\n");
                     break;
