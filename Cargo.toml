@@ -10,10 +10,6 @@ members = [
     "continuum-shim",
 ]
 
-[workspace.package]
-license = "Apache-2.0"
-repository = "https://github.com/omarimtiaz/continuum"
-
 [workspace.dependencies]
 # Serialization
 serde = { version = "1.0", features = ["derive"] }

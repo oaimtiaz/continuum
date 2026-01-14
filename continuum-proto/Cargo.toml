@@ -2,8 +2,7 @@
 name = "continuum-proto"
 version = "0.1.0"
 edition = "2021"
-license.workspace = true
-repository.workspace = true
+license = "Apache-2.0"
 
 [dependencies]
 prost = { workspace = true }
