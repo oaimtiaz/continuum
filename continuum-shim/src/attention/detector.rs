@@ -51,6 +51,8 @@ pub struct AttentionDetector {
     last_emit_at: Option<Instant>,
     /// Current attention state.
     current_state: Option<AttentionKind>,
+    /// Last emitted attention kind (to avoid re-emitting same state).
+    last_emitted_kind: Option<AttentionKind>,
     /// Configuration.
     config: AttentionConfig,
     /// Prompt pattern matcher.
@@ -66,6 +68,7 @@ impl AttentionDetector {
             last_input_at: None,
             last_emit_at: None,
             current_state: None,
+            last_emitted_kind: None,
             config,
             matcher: PromptMatcher::new(),
         }
@@ -74,6 +77,8 @@ impl AttentionDetector {
     /// Process new output from the PTY.
     pub fn on_output(&mut self, data: &[u8], ts: Instant) {
         self.last_output_at = Some(ts);
+        // New output means state may have changed, allow re-emission
+        self.last_emitted_kind = None;
 
         // Add to rolling buffer, evicting old data if needed
         for &byte in data {
@@ -97,6 +102,7 @@ impl AttentionDetector {
         self.last_input_at = Some(ts);
         // Clear any pending attention state
         self.current_state = None;
+        self.last_emitted_kind = None;
         self.buffer.clear();
     }
 
@@ -112,6 +118,7 @@ impl AttentionDetector {
         // If we have a pending state, emit it
         if let Some(kind) = self.current_state.take() {
             self.last_emit_at = Some(now);
+            self.last_emitted_kind = Some(kind);
             let context = self.get_buffer_context();
             return Some(AttentionEvent { kind, context });
         }
@@ -129,7 +136,12 @@ impl AttentionDetector {
         let elapsed = now.duration_since(last_output);
 
         if elapsed >= self.config.stalled_after {
+            // Don't re-emit Stalled if we already did (until new output arrives)
+            if self.last_emitted_kind == Some(AttentionKind::Stalled) {
+                return None;
+            }
             self.last_emit_at = Some(now);
+            self.last_emitted_kind = Some(AttentionKind::Stalled);
             return Some(AttentionEvent {
                 kind: AttentionKind::Stalled,
                 context: self.get_buffer_context(),
@@ -140,7 +152,12 @@ impl AttentionDetector {
             // Check for low-confidence prompts
             let text = self.get_buffer_text();
             if let Some(context) = self.matcher.match_low_confidence(&text) {
+                // Don't re-emit MaybeNeedsInput if we already did
+                if self.last_emitted_kind == Some(AttentionKind::MaybeNeedsInput) {
+                    return None;
+                }
                 self.last_emit_at = Some(now);
+                self.last_emitted_kind = Some(AttentionKind::MaybeNeedsInput);
                 return Some(AttentionEvent {
                     kind: AttentionKind::MaybeNeedsInput,
                     context: Some(context),
