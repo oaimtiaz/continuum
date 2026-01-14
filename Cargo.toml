@@ -28,7 +28,7 @@ prost = "0.13"
 tonic-build = "0.12"
 
 # Async runtime
-tokio = { version = "1.49.0", features = ["macros", "rt-multi-thread"] }
+tokio = { version = "1.49.0", features = ["macros", "rt-multi-thread", "signal"] }
 tokio-stream = "0.1"
 
 # Error handling

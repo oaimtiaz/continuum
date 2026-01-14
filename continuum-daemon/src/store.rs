@@ -1,7 +1,7 @@
 //! In-memory task storage with output buffering and database persistence.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 
 use continuum_core::task::{Stream, Task, TaskEvent, TaskId, TaskStatus};
 use continuum_shim_proto::DaemonToShim;
@@ -63,6 +63,8 @@ struct TaskEntry {
 pub struct TaskStore {
     inner: RwLock<HashMap<TaskId, TaskEntry>>,
     db: DbService,
+    /// Flag indicating the daemon is shutting down.
+    shutting_down: AtomicBool,
 }
 
 impl TaskStore {
@@ -71,7 +73,13 @@ impl TaskStore {
         Self {
             inner: RwLock::new(HashMap::new()),
             db,
+            shutting_down: AtomicBool::new(false),
         }
+    }
+
+    /// Check if the daemon is shutting down.
+    pub fn is_shutting_down(&self) -> bool {
+        self.shutting_down.load(Ordering::Relaxed)
     }
 
     /// Load existing tasks from the database.
@@ -286,6 +294,65 @@ impl TaskStore {
         tracing::debug!(task = %id.0, "Message queued successfully");
 
         Ok(())
+    }
+
+    /// Signal shutdown and notify all connected shims.
+    ///
+    /// Sets the shutting_down flag (checked by output streams), marks running
+    /// tasks as canceled, then sends Shutdown message to all shims and closes channels.
+    ///
+    /// Returns the number of shims that were notified.
+    pub async fn broadcast_shutdown(&self) -> usize {
+        use continuum_core::task::{Actor, TaskEvent, TaskEventKind};
+        use continuum_shim_proto::{daemon_to_shim, Shutdown};
+
+        // Set shutdown flag first - this will cause output streams to exit
+        self.shutting_down.store(true, Ordering::SeqCst);
+
+        let mut inner = self.inner.write().await;
+        let mut count = 0;
+
+        for (task_id, entry) in inner.iter_mut() {
+            // Mark running tasks as canceled so CLI shows correct status
+            if entry.task.status == TaskStatus::Running {
+                let event = TaskEvent::new(TaskEventKind::Canceled {
+                    actor: Actor::system(),
+                });
+                // Apply event to in-memory state (ignore errors during shutdown)
+                let _ = entry.task.apply(&event);
+
+                // Persist to database
+                if let Err(e) = self.db.update_task(&entry.task).await {
+                    tracing::error!(task = %task_id.0, error = %e, "Failed to persist shutdown status");
+                }
+
+                tracing::info!(task = %task_id.0, "Marked task as canceled due to shutdown");
+            }
+
+            if let Some(tx) = entry.shim_tx.take() {
+                let msg = DaemonToShim {
+                    msg: Some(daemon_to_shim::Msg::Shutdown(Shutdown {})),
+                };
+
+                // Use try_send to avoid blocking on stuck shims
+                if tx.try_send(msg).is_ok() {
+                    tracing::debug!(task = %task_id.0, "Sent shutdown to shim");
+                    count += 1;
+                } else {
+                    tracing::warn!(task = %task_id.0, "Failed to send shutdown to shim");
+                }
+                // tx is dropped here, closing the channel
+            }
+        }
+
+        count
+    }
+
+    /// Get count of tasks with active shim connections.
+    #[allow(dead_code)]
+    pub async fn active_shim_count(&self) -> usize {
+        let inner = self.inner.read().await;
+        inner.values().filter(|e| e.shim_tx.is_some()).count()
     }
 
     /// Check if a task exists.

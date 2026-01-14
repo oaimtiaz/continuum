@@ -18,6 +18,7 @@ use continuum_proto::{
 
 use convert::{output_chunk_to_proto, task_to_view};
 use tokio_stream::Stream;
+use tokio::signal;
 use tonic::{transport::Server, Request, Response, Status};
 use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
@@ -216,8 +217,14 @@ impl Continuum for ContinuumService {
                 yield Ok(output_chunk_to_proto(&chunk));
             }
 
-            // Then stream live output until task completes or error
+            // Then stream live output until task completes, error, or shutdown
             loop {
+                // Check if daemon is shutting down
+                if store.is_shutting_down() {
+                    tracing::debug!(task = %task_id_clone.0, "Daemon shutting down, ending stream");
+                    break;
+                }
+
                 // Check if task has completed
                 if let Some(task) = store.get(&task_id_clone).await {
                     if task.status.is_terminal() {
@@ -239,7 +246,7 @@ impl Continuum for ContinuumService {
                         break;
                     }
                     Err(_) => {
-                        // Timeout - loop back to check task status
+                        // Timeout - loop back to check task status and shutdown flag
                         continue;
                     }
                 };
@@ -319,19 +326,82 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let addr = "127.0.0.1:50051".parse()?;
 
     let supervisor = TaskSupervisor::new(store.clone());
-    let service = ContinuumService { store, supervisor };
-
-    tracing::info!("Continuum daemon listening on {}", addr);
+    let service = ContinuumService {
+        store: store.clone(),
+        supervisor,
+    };
 
     let reflection = tonic_reflection::server::Builder::configure()
         .register_encoded_file_descriptor_set(FILE_DESCRIPTOR_SET)
         .build_v1()?;
 
-    Server::builder()
+    let server = Server::builder()
         .add_service(reflection)
-        .add_service(ContinuumServer::new(service))
-        .serve(addr)
-        .await?;
+        .add_service(ContinuumServer::new(service));
+
+    tracing::info!("Continuum daemon listening on {}", addr);
+
+    // Run server with graceful shutdown on SIGTERM/SIGINT
+    let shutdown_result = run_with_graceful_shutdown(server, addr, store).await;
+
+    match shutdown_result {
+        Ok(()) => {
+            tracing::info!("Daemon shutdown complete");
+            Ok(())
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "Daemon shutdown with error");
+            Err(e)
+        }
+    }
+}
+
+/// Run the server with graceful shutdown on SIGTERM/SIGINT.
+async fn run_with_graceful_shutdown(
+    server: tonic::transport::server::Router,
+    addr: std::net::SocketAddr,
+    store: Arc<TaskStore>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let store_for_signal = store.clone();
+
+    // Create shutdown signal future that also triggers store shutdown
+    let shutdown_signal = async move {
+        let ctrl_c = async {
+            signal::ctrl_c()
+                .await
+                .expect("Failed to install Ctrl+C handler");
+        };
+
+        #[cfg(unix)]
+        let terminate = async {
+            signal::unix::signal(signal::unix::SignalKind::terminate())
+                .expect("Failed to install SIGTERM handler")
+                .recv()
+                .await;
+        };
+
+        #[cfg(not(unix))]
+        let terminate = std::future::pending::<()>();
+
+        tokio::select! {
+            _ = ctrl_c => {
+                tracing::info!("Received SIGINT (Ctrl+C), initiating shutdown");
+            }
+            _ = terminate => {
+                tracing::info!("Received SIGTERM, initiating shutdown");
+            }
+        }
+
+        // Signal shutdown immediately so streams can exit
+        let notified = store_for_signal.broadcast_shutdown().await;
+        tracing::info!(count = notified, "Notified shims of shutdown");
+    };
+
+    // Serve with graceful shutdown
+    server.serve_with_shutdown(addr, shutdown_signal).await?;
+
+    // Server has stopped - shims were already notified in the signal handler
+    tracing::info!("Server stopped, shutdown complete");
 
     Ok(())
 }

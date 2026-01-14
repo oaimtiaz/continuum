@@ -585,11 +585,16 @@ async fn cmd_attach(
                 task_id
             );
         } else {
-            // Fetch final task status and show exit info
+            // Fetch final task status and show exit info (with timeout in case daemon is gone)
             let get_request = GetTaskRequest {
                 task_id: task_id.clone(),
             };
-            if let Ok(resp) = client.get_task(get_request).await {
+            let get_result = tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                client.get_task(get_request),
+            )
+            .await;
+            if let Ok(Ok(resp)) = get_result {
                 if let Some(task) = resp.into_inner().task {
                     let exit_msg = match TaskStatus::try_from(task.status) {
                         Ok(TaskStatus::Completed) => {
@@ -634,6 +639,10 @@ async fn cmd_attach(
                         wait_for_keypress();
                     }
                 }
+            } else {
+                // Daemon unreachable (likely shutdown)
+                eprintln!("\n[Connection lost - daemon may have shutdown]");
+                wait_for_keypress();
             }
         }
     }
