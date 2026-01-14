@@ -7,7 +7,7 @@ members = [
     "continuum-daemon",
     "continuum-cli",
     "continuum-pty",
-    "continuum-shim",
+    "continuum-shim", "continuum-auth",
 ]
 
 [workspace.dependencies]
@@ -40,3 +40,16 @@ clap = { version = "4", features = ["derive"] }
 
 # System
 libc = "0.2"
+
+# Security
+argon2 = "0.5.3"
+dirs = "6.0.0"
+ed25519-dalek = "2.2.0"
+keyring = "3.6.3"
+rcgen = "0.14.6"
+rustls = "0.23.36"
+snow = "0.10.0"
+zeroize = "1.8.2"
+
+# Random number generation
+rand = "0.8"
