@@ -84,10 +84,11 @@ pub async fn run(args: Args) -> Result<i32> {
                     if let Some(inner) = msg.msg {
                         match inner {
                             daemon_to_shim::Msg::Stdin(stdin) => {
-                                let _ = stdin_tx_clone.send(stdin.data).await;
+                                if let Err(e) = stdin_tx_clone.send(stdin.data).await {
+                                    tracing::error!("failed to queue stdin: {}", e);
+                                }
                             }
                             daemon_to_shim::Msg::Signal(sig) => {
-                                // Convert signal number to our Signal enum
                                 let signal = match sig.signum {
                                     2 => Signal::Int,
                                     15 => Signal::Term,
@@ -102,8 +103,6 @@ pub async fn run(args: Args) -> Result<i32> {
                                 }
                             }
                             daemon_to_shim::Msg::Resize(resize) => {
-                                // Create a temporary child reference for resize
-                                // Note: We need to handle resize differently since we don't have child here
                                 tracing::debug!(
                                     "resize requested: {}x{}",
                                     resize.rows,
@@ -118,7 +117,7 @@ pub async fn run(args: Args) -> Result<i32> {
                     }
                 }
                 Ok(None) => {
-                    tracing::info!("IPC connection closed");
+                    tracing::debug!("IPC connection closed");
                     break;
                 }
                 Err(e) => {

@@ -34,8 +34,7 @@ pub async fn run_pty_writer(
         .map_err(std::io::Error::other)?;
 
         match result {
-            Ok(n) => {
-                tracing::trace!("wrote {} bytes to PTY", n);
+            Ok(_n) => {
                 // Notify attention detector that input was sent
                 let _ = input_notify_tx.try_send(Instant::now());
             }

@@ -92,8 +92,8 @@ impl TaskSupervisor {
             CreatedVia::Cli,
         );
 
-        // Insert into store
-        self.store.insert(task).await;
+        // Insert into store (persists to database)
+        self.store.insert(task).await?;
 
         // Create socket path
         let socket_path = self.socket_dir.join(format!("{}.sock", task_id.0));
@@ -117,7 +117,10 @@ impl TaskSupervisor {
             .arg("--cols")
             .arg("80")
             .arg("--cwd")
-            .arg(&cwd);
+            .arg(&cwd)
+            // Ensure shim inherits stderr and stdout for logging
+            .stdout(std::process::Stdio::inherit())
+            .stderr(std::process::Stdio::inherit());
 
         // Add environment variables
         for (key, value) in &env {
@@ -137,11 +140,25 @@ impl TaskSupervisor {
             "Spawning task"
         );
 
+        tracing::debug!(task = %task_id.0, "Command: {:?}", shim_cmd);
+
         // Spawn the shim process
-        let _child = shim_cmd.spawn().map_err(|e| {
+        let mut child = shim_cmd.spawn().map_err(|e| {
             tracing::error!(error = %e, shim = %self.shim_binary.display(), "Failed to spawn shim");
             anyhow::anyhow!("Failed to spawn shim: {}", e)
         })?;
+
+        let pid = child.id();
+        tracing::info!(task=%task_id.0, pid=?pid, "Spawned shim");
+
+        tokio::spawn(async move {
+            match child.wait() {
+                Ok(status) => tracing::info!(task=%task_id.0, pid=?pid, %status, "Shim exited"),
+                Err(e) => {
+                    tracing::error!(task=%task_id.0, pid=?pid, error=%e, "Failed waiting for shim")
+                }
+            }
+        });
 
         // Spawn task to accept connection and handle IPC
         let store = self.store.clone();

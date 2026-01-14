@@ -23,10 +23,12 @@ use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
 
 mod convert;
+mod db;
 mod ipc;
 mod store;
 mod supervisor;
 
+use db::DbService;
 use store::TaskStore;
 use supervisor::TaskSupervisor;
 
@@ -193,15 +195,17 @@ impl Continuum for ContinuumService {
 
         let from_offset = req.from_offset.unwrap_or(0) as usize;
 
-        // Get historical output
-        let historical = self.store.get_output(&task_id, from_offset).await;
-
-        // Subscribe to live output
+        // Subscribe FIRST to avoid race condition where output arrives
+        // between fetching historical and subscribing
         let mut receiver = self
             .store
             .subscribe_output(&task_id)
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
+
+        // Then get historical output - any output that arrives during this
+        // call will either be in historical OR caught by the subscription
+        let historical = self.store.get_output(&task_id, from_offset).await;
 
         let store = self.store.clone();
         let task_id_clone = task_id.clone();
@@ -289,11 +293,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .init();
 
+    // Initialize database
+    let db_path = dirs::data_local_dir()
+        .unwrap_or_else(|| std::path::PathBuf::from("."))
+        .join("continuum")
+        .join("daemon.db");
+
+    tracing::info!(path = %db_path.display(), "Opening database");
+
+    let db = DbService::open(&db_path).await?;
+
+    // Mark any tasks that were running when daemon last stopped as failed
+    let orphaned = db.mark_orphaned_tasks_failed().await?;
+    if orphaned > 0 {
+        tracing::warn!(count = orphaned, "Marked orphaned running tasks as failed");
+    }
+
+    // Create store with database and load existing tasks
+    let store = Arc::new(TaskStore::new(db));
+    store.load_from_db().await?;
+
+    let task_count = store.list().await.len();
+    tracing::info!(tasks = task_count, "Loaded tasks from database");
+
     let addr = "127.0.0.1:50051".parse()?;
 
-    let store = Arc::new(TaskStore::new());
     let supervisor = TaskSupervisor::new(store.clone());
-
     let service = ContinuumService { store, supervisor };
 
     tracing::info!("Continuum daemon listening on {}", addr);

@@ -24,14 +24,14 @@ async fn main() {
     // Initialize logging
     tracing_subscriber::fmt()
         .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn")),
         )
         .with_target(false)
         .init();
 
     let args = Args::parse();
 
-    tracing::debug!(?args, "starting shim");
+    tracing::info!(task_id = %args.task_id, "shim started");
 
     let exit_code = match run::run(args).await {
         Ok(code) => code,

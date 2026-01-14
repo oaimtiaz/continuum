@@ -20,6 +20,15 @@ pub async fn run_pty_reader(
     output_tx: mpsc::Sender<PtyOutput>,
     attention_tx: mpsc::Sender<(Vec<u8>, Instant)>,
 ) -> std::io::Result<()> {
+    // Set non-blocking mode (required by AsyncFd)
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    if unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+
     // Wrap the raw fd in AsyncFd for async I/O
     let async_fd = AsyncFd::new(fd)?;
 
@@ -42,7 +51,6 @@ pub async fn run_pty_reader(
         }) {
             Ok(Ok(0)) => {
                 // EOF - PTY closed
-                tracing::debug!("PTY closed (EOF)");
                 break;
             }
             Ok(Ok(n)) => {
@@ -54,7 +62,6 @@ pub async fn run_pty_reader(
 
                 // Send to IPC
                 if output_tx.send(PtyOutput { data, timestamp }).await.is_err() {
-                    tracing::debug!("output channel closed");
                     break;
                 }
             }

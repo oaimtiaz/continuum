@@ -103,11 +103,13 @@ pub async fn handle_shim_connection(task_id: TaskId, stream: UnixStream, store: 
     let task_id_write = task_id.clone();
     let write_handle = tokio::spawn(async move {
         while let Some(msg) = rx.recv().await {
+            tracing::debug!(task = %task_id_write.0, "Writing message to shim");
             let encoded = msg.encode_to_vec();
             if let Err(e) = write_frame(&mut write_half, &encoded).await {
                 tracing::error!(task = %task_id_write.0, error = %e, "Error writing to shim");
                 break;
             }
+            tracing::debug!(task = %task_id_write.0, bytes = encoded.len(), "Wrote to shim");
         }
         tracing::debug!(task = %task_id_write.0, "Write loop ended");
     });

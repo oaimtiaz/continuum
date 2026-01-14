@@ -1,10 +1,13 @@
-//! In-memory task storage with output buffering.
+//! In-memory task storage with output buffering and database persistence.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicI64, Ordering};
 
 use continuum_core::task::{Stream, Task, TaskEvent, TaskId, TaskStatus};
 use continuum_shim_proto::DaemonToShim;
 use tokio::sync::{broadcast, mpsc, RwLock};
+
+use crate::db::DbService;
 
 /// A chunk of output from a task.
 #[derive(Debug, Clone)]
@@ -25,48 +28,99 @@ pub enum StoreError {
     SendFailed(String),
     #[error("invalid state transition: {0}")]
     InvalidTransition(String),
+    #[error("database error: {0}")]
+    Database(String),
+}
+
+impl From<sqlx::Error> for StoreError {
+    fn from(e: sqlx::Error) -> Self {
+        StoreError::Database(e.to_string())
+    }
 }
 
 /// Internal entry for a task with associated channels and buffers.
 struct TaskEntry {
     /// The task state.
     task: Task,
-    /// Buffered output chunks.
+    /// Buffered output chunks (for in-memory access).
     output_buffer: Vec<OutputChunk>,
     /// Broadcast sender for live output streaming.
     output_tx: broadcast::Sender<OutputChunk>,
     /// Channel to send messages to the shim.
     shim_tx: Option<mpsc::Sender<DaemonToShim>>,
+    /// Sequence counter for events (used for DB ordering).
+    event_sequence: AtomicI64,
+    /// Current output chunk offset (for DB persistence).
+    output_offset: AtomicI64,
+    /// Whether this task was loaded from the database (vs created fresh).
+    from_db: bool,
 }
 
-/// In-memory task store.
+/// Task store with database persistence.
+///
+/// Maintains in-memory state for fast access while persisting critical
+/// data to SQLite for durability across daemon restarts.
 pub struct TaskStore {
     inner: RwLock<HashMap<TaskId, TaskEntry>>,
+    db: DbService,
 }
 
 impl TaskStore {
-    /// Create a new empty store.
-    pub fn new() -> Self {
+    /// Create a new store with database persistence.
+    pub fn new(db: DbService) -> Self {
         Self {
             inner: RwLock::new(HashMap::new()),
+            db,
         }
     }
 
-    /// Insert a new task into the store.
-    pub async fn insert(&self, task: Task) -> TaskId {
-        let id = task.id.clone();
-        let (output_tx, _) = broadcast::channel(256);
+    /// Load existing tasks from the database.
+    ///
+    /// Should be called once at startup after marking orphaned tasks as failed.
+    pub async fn load_from_db(&self) -> Result<(), StoreError> {
+        let tasks = self.db.load_all_tasks().await?;
+        let mut inner = self.inner.write().await;
 
+        for task in tasks {
+            let (output_tx, _) = broadcast::channel(256);
+            let entry = TaskEntry {
+                task,
+                output_buffer: Vec::new(), // Output loaded on-demand for historical tasks
+                output_tx,
+                shim_tx: None,
+                event_sequence: AtomicI64::new(0),
+                output_offset: AtomicI64::new(0),
+                from_db: true,
+            };
+            inner.insert(entry.task.id.clone(), entry);
+        }
+
+        Ok(())
+    }
+
+    /// Insert a new task into the store.
+    ///
+    /// Persists the task to the database immediately (write-through).
+    pub async fn insert(&self, task: Task) -> Result<TaskId, StoreError> {
+        let id = task.id.clone();
+
+        // Persist to database first
+        self.db.insert_task(&task).await?;
+
+        let (output_tx, _) = broadcast::channel(256);
         let entry = TaskEntry {
             task,
             output_buffer: Vec::new(),
             output_tx,
             shim_tx: None,
+            event_sequence: AtomicI64::new(0),
+            output_offset: AtomicI64::new(0),
+            from_db: false,
         };
 
         let mut inner = self.inner.write().await;
         inner.insert(id.clone(), entry);
-        id
+        Ok(id)
     }
 
     /// Get a task by ID.
@@ -82,39 +136,106 @@ impl TaskStore {
     }
 
     /// Apply an event to a task.
+    ///
+    /// For lifecycle events (Started, Exited, Canceled, FailedToStart),
+    /// the updated task state is persisted to the database.
     pub async fn apply_event(&self, id: &TaskId, event: TaskEvent) -> Result<(), StoreError> {
+        let is_lifecycle = event.is_lifecycle();
+
         let mut inner = self.inner.write().await;
         let entry = inner
             .get_mut(id)
             .ok_or_else(|| StoreError::TaskNotFound(id.0.to_string()))?;
 
+        // Apply event to in-memory state
         entry
             .task
             .apply(&event)
             .map_err(|e| StoreError::InvalidTransition(e.to_string()))?;
 
+        // Persist lifecycle events to database
+        if is_lifecycle {
+            let seq = entry.event_sequence.fetch_add(1, Ordering::SeqCst);
+
+            // Update task state in DB
+            if let Err(e) = self.db.update_task(&entry.task).await {
+                tracing::error!(error = %e, task = %id.0, "Failed to persist task state");
+            }
+
+            // Insert event for audit trail
+            if let Err(e) = self.db.insert_event(id, &event, seq).await {
+                tracing::error!(error = %e, task = %id.0, "Failed to persist event");
+            }
+        }
+
         Ok(())
     }
 
-    /// Append output to a task's buffer and broadcast to subscribers.
+    /// Append output to a task's buffer, broadcast to subscribers, and persist to DB.
+    ///
+    /// Output is persisted immediately (optimistic drain) so that if the daemon
+    /// crashes, we don't lose output data.
     pub async fn append_output(&self, id: &TaskId, chunk: OutputChunk) {
-        let mut inner = self.inner.write().await;
-        if let Some(entry) = inner.get_mut(id) {
-            // Buffer the output
-            entry.output_buffer.push(chunk.clone());
+        let offset = {
+            let mut inner = self.inner.write().await;
+            if let Some(entry) = inner.get_mut(id) {
+                // Get and increment offset atomically
+                let offset = entry.output_offset.fetch_add(1, Ordering::SeqCst);
 
-            // Broadcast to subscribers (ignore errors - no subscribers is fine)
-            let _ = entry.output_tx.send(chunk);
+                // Buffer the output for in-memory access
+                entry.output_buffer.push(chunk.clone());
+
+                // Broadcast to subscribers (ignore errors - no subscribers is fine)
+                let _ = entry.output_tx.send(chunk.clone());
+
+                Some((offset, chunk))
+            } else {
+                None
+            }
+        };
+
+        // Persist to database outside the lock
+        if let Some((offset, chunk)) = offset {
+            if let Err(e) = self
+                .db
+                .insert_output_chunks(id, &[(chunk, offset as usize)])
+                .await
+            {
+                tracing::error!(error = %e, task = %id.0, offset = offset, "Failed to persist output chunk");
+            }
         }
     }
 
     /// Get buffered output starting from an offset.
+    ///
+    /// For tasks loaded from the database (historical), this loads output from
+    /// the database. For active tasks, returns from the in-memory buffer.
     pub async fn get_output(&self, id: &TaskId, from_offset: usize) -> Vec<OutputChunk> {
         let inner = self.inner.read().await;
-        inner
-            .get(id)
-            .map(|e| e.output_buffer.iter().skip(from_offset).cloned().collect())
-            .unwrap_or_default()
+
+        if let Some(entry) = inner.get(id) {
+            // For tasks loaded from DB with terminal status, load from database
+            if entry.from_db && entry.task.status.is_terminal() && entry.output_buffer.is_empty() {
+                drop(inner); // Release lock before DB call
+                match self.db.load_output(id, from_offset).await {
+                    Ok(chunks) => return chunks,
+                    Err(e) => {
+                        tracing::error!(error = %e, task = %id.0, "Failed to load output from DB");
+                        return Vec::new();
+                    }
+                }
+            }
+
+            // For active tasks or tasks with in-memory buffer, use buffer
+            entry
+                .output_buffer
+                .iter()
+                .skip(from_offset)
+                .cloned()
+                .collect()
+        } else {
+            Vec::new()
+        }
     }
 
     /// Subscribe to live output for a task.
@@ -159,8 +280,10 @@ impl TaskStore {
             .as_ref()
             .ok_or_else(|| StoreError::ShimNotConnected(id.0.to_string()))?;
 
+        tracing::debug!(task = %id.0, "Queuing message to shim channel");
         tx.try_send(msg)
             .map_err(|e| StoreError::SendFailed(e.to_string()))?;
+        tracing::debug!(task = %id.0, "Message queued successfully");
 
         Ok(())
     }
@@ -195,12 +318,6 @@ impl TaskStore {
     }
 }
 
-impl Default for TaskStore {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -208,7 +325,17 @@ mod tests {
     use continuum_core::task::{CreatedVia, TaskEventKind, TaskId};
     use std::collections::BTreeMap;
     use std::path::PathBuf;
+    use tempfile::tempdir;
     use uuid::Uuid;
+
+    async fn make_store() -> TaskStore {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        let db = DbService::open(&db_path).await.unwrap();
+        // Leak the tempdir to keep the DB file alive for the test
+        std::mem::forget(dir);
+        TaskStore::new(db)
+    }
 
     fn make_task(name: &str) -> Task {
         Task::new(
@@ -224,11 +351,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_insert_and_get() {
-        let store = TaskStore::new();
+        let store = make_store().await;
         let task = make_task("test");
         let id = task.id.clone();
 
-        store.insert(task.clone()).await;
+        store.insert(task.clone()).await.unwrap();
 
         let retrieved = store.get(&id).await;
         assert!(retrieved.is_some());
@@ -237,10 +364,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_list_tasks() {
-        let store = TaskStore::new();
+        let store = make_store().await;
 
-        store.insert(make_task("task1")).await;
-        store.insert(make_task("task2")).await;
+        store.insert(make_task("task1")).await.unwrap();
+        store.insert(make_task("task2")).await.unwrap();
 
         let tasks = store.list().await;
         assert_eq!(tasks.len(), 2);
@@ -248,10 +375,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_apply_event() {
-        let store = TaskStore::new();
+        let store = make_store().await;
         let task = make_task("test");
         let id = task.id.clone();
-        store.insert(task).await;
+        store.insert(task).await.unwrap();
 
         // Apply Started event
         let event = TaskEvent::new(TaskEventKind::Started { pid: Some(1234) });
@@ -264,10 +391,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_output_buffering() {
-        let store = TaskStore::new();
+        let store = make_store().await;
         let task = make_task("test");
         let id = task.id.clone();
-        store.insert(task).await;
+        store.insert(task).await.unwrap();
 
         // Append some output
         store
@@ -306,10 +433,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_output_subscription() {
-        let store = TaskStore::new();
+        let store = make_store().await;
         let task = make_task("test");
         let id = task.id.clone();
-        store.insert(task).await;
+        store.insert(task).await.unwrap();
 
         // Subscribe before appending
         let mut rx = store.subscribe_output(&id).await.unwrap();
@@ -329,5 +456,44 @@ mod tests {
         // Receive should work
         let chunk = rx.recv().await.unwrap();
         assert_eq!(chunk.data, b"test");
+    }
+
+    #[tokio::test]
+    async fn test_persistence_roundtrip() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+
+        // Create store, insert task, apply events
+        {
+            let db = DbService::open(&db_path).await.unwrap();
+            let store = TaskStore::new(db);
+
+            let task = make_task("persistent-task");
+            let id = task.id.clone();
+            store.insert(task).await.unwrap();
+
+            // Start the task
+            let event = TaskEvent::new(TaskEventKind::Started { pid: Some(9999) });
+            store.apply_event(&id, event).await.unwrap();
+
+            // Verify in-memory state
+            let task = store.get(&id).await.unwrap();
+            assert_eq!(task.status, TaskStatus::Running);
+        }
+
+        // Create new store from same DB, verify task was loaded
+        {
+            let db = DbService::open(&db_path).await.unwrap();
+            let store = TaskStore::new(db);
+            store.load_from_db().await.unwrap();
+
+            let tasks = store.list().await;
+            assert_eq!(tasks.len(), 1);
+
+            let task = &tasks[0];
+            assert_eq!(task.name, "persistent-task");
+            assert_eq!(task.status, TaskStatus::Running);
+            assert_eq!(task.pid, Some(9999));
+        }
     }
 }
