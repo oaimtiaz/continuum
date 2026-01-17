@@ -4,7 +4,36 @@
 
 Before you can run tasks on a Continuum daemon, your device must be enrolled. This is a one-time setup that establishes trust between your device and the daemon.
 
-## Steps
+## Local Enrollment (Same Machine)
+
+If you're running the CLI on the same machine as the daemon, use local enrollment—no token required:
+
+```bash
+continuum enroll --local
+```
+
+This works by reading a shared secret from the filesystem that only local processes can access.
+
+### How It Works
+
+1. The daemon writes trust files to `$XDG_RUNTIME_DIR/continuum/`:
+   - `server-fingerprint` — the daemon's identity
+   - `local-trust-token` — a 32-byte secret
+2. The CLI reads these files and sends a proof (SHA256 of the token) to the daemon
+3. The daemon verifies the proof and approves enrollment
+
+### Requirements
+
+Local enrollment requires `$XDG_RUNTIME_DIR` to be set:
+
+- **Linux**: Usually set automatically by systemd to `/run/user/$UID`
+- **macOS**: Not set by default—see [Troubleshooting](#troubleshooting)
+
+---
+
+## Token-Based Enrollment (Remote)
+
+For remote enrollment or when local enrollment isn't available:
 
 ### 1. Get an Enrollment Token
 
@@ -22,18 +51,20 @@ Tokens look like: `AQAA-xxxx-xxxx-xxxx-...`
 Run the enroll command with the token you received:
 
 ```bash
-continuum enroll AQAA-xxxx-xxxx-xxxx-...
+continuum enroll -t AQAA-xxxx-xxxx-xxxx-...
 ```
 
 You can add a label to identify your device:
 
 ```bash
-continuum enroll AQAA-xxxx-xxxx-xxxx-... --label "my-laptop"
+continuum enroll -t AQAA-xxxx-xxxx-xxxx-... --label "my-laptop"
 ```
 
 Enrollment is automatic once you provide a valid token.
 
-### 3. Verify Enrollment
+---
+
+## Verify Enrollment
 
 Check that your device is enrolled:
 
@@ -45,13 +76,48 @@ You should see: `Client is authorized`
 
 ## Troubleshooting
 
-**"Token expired"** - Tokens are only valid for 5 minutes. Ask your administrator for a new token.
+### Local Enrollment Issues
 
-**"Enrollment rejected"** - The token may have already been used (tokens are single-use). Request a new token.
+**"No secure runtime directory available. Set $XDG_RUNTIME_DIR."**
 
-**"Not enrolled"** - Run `continuum enroll <token>` with a valid token first.
+The daemon and CLI need a secure directory for local trust files. On macOS, set it up:
 
-**"Connection refused"** - Make sure the daemon is running and you have the correct address. Check with `--daemon <address>` if needed.
+```bash
+# Add to your shell profile (~/.zshrc or ~/.bashrc)
+export XDG_RUNTIME_DIR="${TMPDIR:-/tmp}/runtime-$(id -u)"
+mkdir -p "$XDG_RUNTIME_DIR"
+chmod 700 "$XDG_RUNTIME_DIR"
+```
+
+Then restart your terminal and the daemon.
+
+**"Server fingerprint not found. Is the daemon running locally?"**
+
+The daemon hasn't written its fingerprint file yet. Ensure:
+1. The daemon is running
+2. `$XDG_RUNTIME_DIR` is set for both daemon and CLI
+3. Check that `$XDG_RUNTIME_DIR/continuum/server-fingerprint` exists
+
+**"Local trust proof not available."**
+
+The CLI can't read the trust token. Check:
+1. The daemon is running on the same machine
+2. Both processes use the same `$XDG_RUNTIME_DIR`
+3. File permissions allow your user to read `$XDG_RUNTIME_DIR/continuum/local-trust-token`
+
+### Token-Based Enrollment Issues
+
+**"Token expired"** — Tokens are only valid for 5 minutes. Ask your administrator for a new token.
+
+**"Enrollment rejected"** — The token may have already been used (tokens are single-use). Request a new token.
+
+**"Invalid enrollment token format"** — Check that you copied the entire token, including the `AQAA-` prefix.
+
+### General Issues
+
+**"Not enrolled"** — Run `continuum enroll --local` or `continuum enroll -t <token>` first.
+
+**"Connection refused"** — Make sure the daemon is running. For remote connections, check the address with `--daemon <address>`.
 
 ## For Administrators
 
