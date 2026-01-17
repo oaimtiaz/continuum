@@ -161,9 +161,10 @@ mod tests {
 
     #[test]
     fn audit_target_task_roundtrip() {
-        let target = AuditTarget::Task(TaskId::new(Uuid::new_v4()));
+        let uuid = Uuid::parse_str("d546a8c5-2249-4adb-8a05-f73d3d59d0e8").unwrap();
+        let target = AuditTarget::Task(TaskId::new(uuid));
         let json = serde_json::to_string(&target).unwrap();
-        assert_eq!(json, r#"{"type":"task","id":"task-123"}"#);
+        assert_eq!(json, r#"{"type":"task","id":"d546a8c5-2249-4adb-8a05-f73d3d59d0e8"}"#);
         let parsed: AuditTarget = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed, target);
     }

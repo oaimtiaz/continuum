@@ -6,11 +6,13 @@ license = "Apache-2.0"
 
 [dependencies]
 anyhow = { workspace = true }
+clap = { workspace = true }
 uuid = { workspace = true }
 chrono = { workspace = true }
 continuum-core = { path = "../continuum-core" }
 continuum-proto = { path = "../continuum-proto" }
 continuum-shim-proto = { path = "../continuum-shim-proto" }
+continuum-auth = { path = "../continuum-auth" }
 tokio = { workspace = true }
 tokio-stream = { workspace = true }
 tonic = { workspace = true }
@@ -26,5 +28,38 @@ sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite", "macros", "migr
 serde_json = { workspace = true }
 dirs = "5.0"
 
+# TLS and certificates
+rcgen = { workspace = true }
+rustls = { workspace = true }
+tokio-rustls = { workspace = true }
+rustls-pemfile = { workspace = true }
+
+# Auth support
+arc-swap = "1.7"
+dashmap = "6"
+sha2 = "0.10"
+hex = "0.4"
+base64 = { workspace = true }
+subtle = { workspace = true }
+getrandom = "0.2"
+time = "0.3"
+libc = { workspace = true }
+
+# HTTP/2 support for TLS incoming
+hyper-util = { version = "0.1", features = ["tokio"] }
+
+# Rate limiting (M3)
+governor = "0.6"
+
+# HMAC for trust store integrity (H2)
+hmac = "0.12"
+
+# Certificate validity checking (M5)
+x509-parser = "0.16"
+
 [dev-dependencies]
 tempfile = "3.15"
+futures = "0.3"
+tokio-stream = { workspace = true }
+x509-parser = "0.16"
+hex = "0.4"

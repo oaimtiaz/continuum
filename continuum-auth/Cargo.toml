@@ -1,21 +1,37 @@
 [package]
 name = "continuum-auth"
 version = "0.1.0"
-edition = "2024"
+edition = "2021"
 license = "Apache-2.0"
 
 
 [dependencies]
-argon2 = { workspace = true }
-dirs = { workspace = true }
-ed25519-dalek = { workspace = true, features = ["zeroize", "rand_core"] }
-keyring = { workspace = true }
-rcgen = { workspace = true }
-rustls = { workspace = true }
-snow = { workspace = true }
-zeroize = { workspace = true, features = ["zeroize_derive"] }
+# Core cryptography
+ed25519-dalek = { workspace = true, features = ["zeroize", "rand_core", "serde", "pkcs8"] }
+sha2 = "0.10"
+subtle = { workspace = true }
+zeroize = { workspace = true, features = ["derive"] }
+
+# Encoding
+base64 = { workspace = true }
+
+# Time
+chrono = { workspace = true }
+
+# Error handling
 thiserror = { workspace = true }
+
+# Serialization
+serde = { workspace = true, features = ["derive"] }
+
+# Random
 rand = { workspace = true }
-hex = "0.4.3"
-sha2 = "0.10.9"
-base64.workspace = true
+
+# X.509 certificate parsing
+x509-parser = "0.17"
+
+# Replay cache implementation (H6)
+dashmap = "6"
+
+# HMAC for trust store integrity (H2)
+hmac = "0.12"

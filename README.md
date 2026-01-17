@@ -47,7 +47,24 @@ RUST_LOG=info ./target/release/continuum-daemon
 ./target/release/continuum-daemon &
 ```
 
-The daemon listens on `127.0.0.1:50051` by default.
+The daemon listens on two ports:
+- **Port 50051**: Enrollment service (server-auth TLS only)
+- **Port 50052**: Main API (mTLS required)
+
+### Enroll a Client
+
+Before using the CLI, you need to enroll your device. See [Enrollment Guide](docs/enrollment.md) for details.
+
+**Quick start (same machine):**
+
+```bash
+# Same-machine auto-enrollment (simplest)
+./target/release/continuum enroll --local
+
+# Or with a token (for remote enrollment)
+./target/release/continuum-daemon token generate --label "my-laptop"
+./target/release/continuum enroll -t AQAA-xxxx-xxxx-...
+```
 
 ### Use the CLI
 
@@ -86,6 +103,9 @@ The daemon listens on `127.0.0.1:50051` by default.
 continuum [OPTIONS] <COMMAND>
 
 Commands:
+  enroll   Enroll this client with the daemon
+  status   Check enrollment status
+  clients  Manage authorized clients
   run      Run a new task
   ls       List tasks
   show     Show task details
@@ -94,9 +114,28 @@ Commands:
   cancel   Cancel a running task
 
 Global Options:
-  --daemon <ADDR>   Daemon address [default: http://127.0.0.1:50051]
+  --daemon <ADDR>   Daemon address [default: http://127.0.0.1:50052]
   --json            Output JSON instead of human-readable text
   -v, --verbose     Verbose output
+```
+
+#### `enroll` - Enroll with Daemon
+
+```bash
+continuum enroll <TOKEN> [--label <NAME>]
+```
+
+#### `status` - Check Enrollment Status
+
+```bash
+continuum status
+```
+
+#### `clients` - Manage Authorized Clients (Admin)
+
+```bash
+continuum clients list           # List enrolled clients
+continuum clients revoke <FP>    # Revoke by fingerprint
 ```
 
 #### `run` - Start a Task
@@ -167,11 +206,12 @@ Options:
 
 ## Project Structure
 
-This is a Rust workspace with seven crates:
+This is a Rust workspace with eight crates:
 
 ```
 continuum/
 ├── continuum-core/       # Pure domain types (IO-free)
+├── continuum-auth/       # Pure authentication library (IO-free)
 ├── continuum-proto/      # gRPC protobuf definitions
 ├── continuum-shim-proto/ # Shim↔Daemon IPC protocol
 ├── continuum-pty/        # PTY spawn/read/write/signal
@@ -196,22 +236,35 @@ Pure domain types and business logic. Intentionally IO-free:
 -   `Device`, `DeviceRole` — Multi-device identity and authorization
 -   `AuditEvent` — Security and compliance logging
 
+### `continuum-auth`
+
+Pure authentication library. Also IO-free—all persistence is injected via traits:
+
+-   Ed25519 keypairs with secure memory handling
+-   Signed enrollment tokens (no TOFU)
+-   mTLS certificate verification
+-   Server trust and client allowlist abstractions
+
 ### `continuum-daemon`
 
 The service that runs on your host machine:
 
+-   Dual-port gRPC server (enrollment on 50051, main API on 50052)
+-   mTLS authentication for all API calls
 -   Executes tasks via shim processes with PTY sessions
--   Streams output to connected clients via gRPC
+-   Streams output to connected clients
 -   Detects when tasks need input (attention state)
--   Manages task lifecycle and IPC with shims
+-   SQLite persistence for tasks and auth state
 
 ### `continuum-cli`
 
 Command-line interface for interacting with the daemon:
 
+-   Device enrollment (local or token-based)
 -   Start, stop, and monitor tasks
--   Send input to running tasks
+-   Send input to running tasks (including interactive `~.` detach)
 -   Stream live output
+-   Client management (list, revoke)
 
 ## Task Lifecycle
 
@@ -247,18 +300,19 @@ Tasks use an event-sourced state machine. Each state transition is recorded as a
 
 Early development. Core functionality works:
 
--   Task execution with PTY support
--   Output streaming and input forwarding
--   Basic attention detection
+-   Task execution with full PTY support (colors, control codes)
+-   Live output streaming and input forwarding
+-   Attention detection (password prompts, stalls)
+-   Client enrollment with signed tokens (no TOFU)
+-   mTLS for secure connections
+-   SQLite persistence for tasks and auth
+-   Same-machine trust (local auto-enrollment)
+-   Graceful shutdown with task cancellation
 
 Not yet implemented:
 
--   Task persistence (in-memory only)
 -   Multi-device sync
--   Authentication/TLS
 -   Mobile/web clients
-
-Roadmap: Coming soon.
 
 ## Contributors
 

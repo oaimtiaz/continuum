@@ -6,12 +6,21 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
+use commands::{check_status, clients, run_enrollment, run_local_enrollment, EnrollmentResult, IdentityStore};
+use continuum_auth::identity::Fingerprint;
 use continuum_proto::{
     continuum_client::ContinuumClient, CancelTaskRequest, GetTaskRequest, ListTasksRequest,
     RunTaskRequest, SendInputRequest, StreamOutputRequest, TaskStatus, TaskView,
 };
+use tls::{build_mtls_config, build_tls_channel, EnrollmentVerifier};
 use tokio_stream::StreamExt;
 use tonic::transport::Channel;
+use trust::TrustStore;
+
+mod commands;
+mod tls;
+mod trust;
+mod utils;
 
 // ============================================================================
 // Raw Terminal Mode
@@ -63,8 +72,8 @@ impl Drop for RawModeGuard {
 #[derive(Parser)]
 #[command(name = "continuum", version, about)]
 struct Cli {
-    /// Daemon address
-    #[arg(long, default_value = "http://127.0.0.1:50051", global = true)]
+    /// Daemon address (port 50052 for main API, 50051 for enrollment)
+    #[arg(long, default_value = "http://127.0.0.1:50052", global = true)]
     daemon: String,
 
     /// Output JSON instead of human-readable text
@@ -81,6 +90,24 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Enroll this client with the daemon
+    Enroll {
+        /// Enrollment token (required for remote enrollment)
+        #[arg(long, short = 't', required_unless_present = "local")]
+        token: Option<String>,
+
+        /// Optional label for this client
+        #[arg(long)]
+        label: Option<String>,
+
+        /// Use local enrollment (same-machine, no token required)
+        #[arg(long)]
+        local: bool,
+    },
+
+    /// Check enrollment status
+    Status,
+
     /// Run a new task
     Run {
         /// Interactive mode (PTY-backed)
@@ -177,6 +204,24 @@ enum Commands {
         #[arg(long)]
         force: bool,
     },
+
+    /// Manage authorized clients
+    Clients {
+        #[command(subcommand)]
+        action: ClientsAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum ClientsAction {
+    /// List all authorized clients
+    List,
+
+    /// Revoke a client's authorization
+    Revoke {
+        /// Client fingerprint to revoke (e.g., SHA256:abc...)
+        fingerprint: String,
+    },
 }
 
 #[derive(Clone, ValueEnum)]
@@ -215,9 +260,59 @@ async fn main() -> Result<()> {
 }
 
 async fn run(cli: Cli) -> Result<()> {
-    let mut client = connect(&cli.daemon).await?;
-
+    // Handle commands that don't need a task client connection
     match &cli.command {
+        Commands::Enroll { token, label, local } => {
+            // Enrollment uses port 50051 (server-auth only, no mTLS)
+            let enrollment_addr = to_enrollment_addr(&cli.daemon);
+            if *local {
+                return cmd_enroll_local(&enrollment_addr, label.as_deref()).await;
+            } else {
+                let token = token
+                    .as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("Token required (or use --local)"))?;
+                return cmd_enroll(&enrollment_addr, token, label.as_deref()).await;
+            }
+        }
+        Commands::Status => {
+            return cmd_status(&cli.daemon).await;
+        }
+        Commands::Clients { action } => {
+            return cmd_clients(&cli, action).await;
+        }
+        _ => {}
+    }
+
+    // For local connections, use ad-hoc mode (sends local proof header)
+    // For remote connections, use enrolled mode (mTLS)
+    if is_local_address(&cli.daemon) {
+        match connect_local_adhoc(&cli.daemon).await {
+            Ok(mut client) => run_task_commands(&mut client, &cli).await,
+            Err(local_err) => {
+                Err(local_err.context("Local connection failed. Is the daemon running?"))
+            }
+        }
+    } else {
+        // Remote connection requires enrollment
+        match connect_authenticated(&cli.daemon).await {
+            Ok(mut client) => run_task_commands(&mut client, &cli).await,
+            Err(err) => Err(err.context("Not enrolled with remote daemon")),
+        }
+    }
+}
+
+/// Execute task commands with a connected client.
+/// Generic over the transport type to support both enrolled and ad-hoc connections.
+async fn run_task_commands<T>(client: &mut ContinuumClient<T>, cli: &Cli) -> Result<()>
+where
+    T: tonic::client::GrpcService<tonic::body::BoxBody> + Clone + Send + 'static,
+    T::ResponseBody: tonic::codegen::Body<Data = tonic::codegen::Bytes> + Send + 'static,
+    T::Error: Into<tonic::codegen::StdError>,
+    <T::ResponseBody as tonic::codegen::Body>::Error: Into<tonic::codegen::StdError> + Send,
+    T::Future: Send,
+{
+    match &cli.command {
+        Commands::Enroll { .. } | Commands::Status | Commands::Clients { .. } => unreachable!(),
         Commands::Run {
             interactive,
             name,
@@ -226,8 +321,8 @@ async fn run(cli: Cli) -> Result<()> {
             cmd,
         } => {
             cmd_run(
-                &mut client,
-                &cli,
+                client,
+                cli,
                 *interactive,
                 name.clone(),
                 cwd.clone(),
@@ -241,18 +336,16 @@ async fn run(cli: Cli) -> Result<()> {
             status,
             recent,
             all,
-        } => cmd_ls(&mut client, &cli, status.clone(), *recent, *all).await,
+        } => cmd_ls(client, cli, status.clone(), *recent, *all).await,
 
-        Commands::Show { task_id, tail } => {
-            cmd_show(&mut client, &cli, task_id.clone(), *tail).await
-        }
+        Commands::Show { task_id, tail } => cmd_show(client, cli, task_id.clone(), *tail).await,
 
         Commands::Attach {
             task_id,
             interactive,
             raw: _,
             no_follow,
-        } => cmd_attach(&mut client, &cli, task_id.clone(), *interactive, *no_follow).await,
+        } => cmd_attach(client, cli, task_id.clone(), *interactive, *no_follow).await,
 
         Commands::Send {
             task_id,
@@ -262,7 +355,7 @@ async fn run(cli: Cli) -> Result<()> {
             raw,
         } => {
             cmd_send(
-                &mut client,
+                client,
                 task_id.clone(),
                 data.clone(),
                 file.clone(),
@@ -272,31 +365,205 @@ async fn run(cli: Cli) -> Result<()> {
             .await
         }
 
-        Commands::Cancel { task_id, force } => {
-            cmd_cancel(&mut client, task_id.clone(), *force).await
+        Commands::Cancel { task_id, force } => cmd_cancel(client, task_id.clone(), *force).await,
+    }
+}
+
+/// Connect to daemon with mTLS and return the channel (requires prior enrollment).
+async fn connect_authenticated_channel(addr: &str) -> Result<Channel> {
+    // Load trust store to get server fingerprint
+    let trust_store = TrustStore::load()?;
+    let trusted = trust_store
+        .get(addr)
+        .with_context(|| format!("Not enrolled with {}. Run 'continuum enroll <token>' first.", addr))?;
+
+    // Load client identity
+    let identity_store = IdentityStore::open()?;
+    let (_private_key, identity) = identity_store.load_or_generate()?;
+
+    // Parse stored server fingerprint
+    let server_fp = Fingerprint::parse(&trusted.fingerprint)
+        .context("Invalid server fingerprint in trust store")?;
+
+    // Create verifier that pins to the trusted fingerprint
+    let verifier = EnrollmentVerifier::from_fingerprint(&server_fp);
+
+    // Build mTLS config with client identity and pinned server verification
+    let tls_config = build_mtls_config(&identity, verifier)?;
+
+    build_tls_channel(addr, tls_config)
+        .await
+        .context("Failed to connect with mTLS")
+}
+
+/// Connect to daemon with mTLS (requires prior enrollment).
+async fn connect_authenticated(addr: &str) -> Result<ContinuumClient<Channel>> {
+    let channel = connect_authenticated_channel(addr).await?;
+    Ok(ContinuumClient::new(channel))
+}
+
+/// Check if an address is a local address.
+fn is_local_address(addr: &str) -> bool {
+    addr.contains("127.0.0.1") || addr.contains("localhost") || addr.contains("[::1]")
+}
+
+/// Convert a daemon address to the enrollment port (50051).
+///
+/// The main API runs on port 50052 (mTLS required), while enrollment
+/// runs on port 50051 (server-auth only, no client cert required).
+fn to_enrollment_addr(addr: &str) -> String {
+    // Replace port 50052 with 50051 for enrollment
+    addr.replace(":50052", ":50051")
+}
+
+/// Convert an enrollment address back to the main API port (50052).
+///
+/// Used when storing trust entries - we want to key by main API address.
+fn to_main_api_addr(addr: &str) -> String {
+    // Replace port 50051 with 50052 for main API
+    addr.replace(":50051", ":50052")
+}
+
+/// Connect to local daemon without enrollment (ad-hoc mode).
+/// Returns a channel that can be used with the same-machine proof.
+async fn connect_local_adhoc_channel(addr: &str) -> Result<Channel> {
+    use commands::{compute_local_trust_proof, read_local_server_fingerprint};
+
+    // Read server fingerprint from local file
+    let server_fingerprint = read_local_server_fingerprint()
+        .context("Server fingerprint not found. Is daemon running locally?")?;
+
+    // Verify same-machine proof is available
+    let _local_trust_proof = compute_local_trust_proof()
+        .context("Not on same machine as daemon")?;
+
+    // Create TLS config pinned to server fingerprint (no client cert)
+    let verifier = EnrollmentVerifier::from_fingerprint(&server_fingerprint);
+    let tls_config = rustls::ClientConfig::builder()
+        .dangerous()
+        .with_custom_certificate_verifier(verifier)
+        .with_no_client_auth();
+
+    build_tls_channel(addr, tls_config)
+        .await
+        .context("Failed to connect to local daemon")
+}
+
+/// Interceptor that injects same-machine proof into requests.
+#[derive(Clone)]
+struct LocalProofInterceptor {
+    proof: [u8; 32],
+}
+
+impl tonic::service::Interceptor for LocalProofInterceptor {
+    fn call(&mut self, mut req: tonic::Request<()>) -> Result<tonic::Request<()>, tonic::Status> {
+        req.metadata_mut().insert_bin(
+            "x-local-trust-proof-bin",
+            tonic::metadata::MetadataValue::from_bytes(&self.proof),
+        );
+        Ok(req)
+    }
+}
+
+/// Connect to local daemon without enrollment (ad-hoc mode).
+/// Returns a client with interceptor that injects same-machine proof.
+async fn connect_local_adhoc(
+    addr: &str,
+) -> Result<ContinuumClient<tonic::service::interceptor::InterceptedService<Channel, LocalProofInterceptor>>>
+{
+    use commands::compute_local_trust_proof;
+
+    let channel = connect_local_adhoc_channel(addr).await?;
+
+    // Get the proof for the interceptor
+    let proof = compute_local_trust_proof().context("Not on same machine as daemon")?;
+
+    let interceptor = LocalProofInterceptor { proof };
+    Ok(ContinuumClient::with_interceptor(channel, interceptor))
+}
+
+// ============================================================================
+// Enrollment Commands
+// ============================================================================
+
+fn print_enrollment_result(result: EnrollmentResult, prefix: &str) -> Result<()> {
+    match result {
+        EnrollmentResult::Approved { client_fingerprint } => {
+            eprintln!("{} enrollment approved!", prefix);
+            eprintln!("  Client fingerprint: {}", client_fingerprint);
+            Ok(())
+        }
+        EnrollmentResult::Pending { client_fingerprint } => {
+            eprintln!("Enrollment pending approval");
+            eprintln!("  Client fingerprint: {}", client_fingerprint);
+            eprintln!("  Run 'continuum status' to check approval status.");
+            Ok(())
+        }
+        EnrollmentResult::Rejected { reason } => {
+            anyhow::bail!("Enrollment rejected: {}", reason);
         }
     }
 }
 
-async fn connect(addr: &str) -> Result<ContinuumClient<Channel>> {
-    ContinuumClient::connect(addr.to_string())
-        .await
-        .context("Failed to connect to daemon")
+async fn cmd_enroll(enrollment_addr: &str, token: &str, label: Option<&str>) -> Result<()> {
+    // Convert enrollment address (50051) to main API address (50052) for trust store
+    let main_api_addr = to_main_api_addr(enrollment_addr);
+    eprintln!("Enrolling with daemon at {}", enrollment_addr);
+    let result = run_enrollment(enrollment_addr, &main_api_addr, token, label).await?;
+    print_enrollment_result(result, "Remote")
+}
+
+async fn cmd_enroll_local(enrollment_addr: &str, label: Option<&str>) -> Result<()> {
+    // Convert enrollment address (50051) to main API address (50052) for trust store
+    let main_api_addr = to_main_api_addr(enrollment_addr);
+    eprintln!("Local enrollment with daemon at {}", enrollment_addr);
+    let result = run_local_enrollment(enrollment_addr, &main_api_addr, label).await?;
+    print_enrollment_result(result, "Local")
+}
+
+async fn cmd_status(daemon_addr: &str) -> Result<()> {
+    let is_authorized = check_status(daemon_addr).await?;
+
+    if is_authorized {
+        eprintln!("✓ Client is authorized");
+    } else {
+        eprintln!("✗ Client is not authorized");
+        eprintln!("  Run 'continuum enroll <token>' to enroll.");
+    }
+
+    Ok(())
+}
+
+async fn cmd_clients(cli: &Cli, action: &ClientsAction) -> Result<()> {
+    // Connect with mTLS for admin commands
+    let channel = connect_authenticated_channel(&cli.daemon).await?;
+
+    match action {
+        ClientsAction::List => clients::list_clients(channel, cli.json).await,
+        ClientsAction::Revoke { fingerprint } => clients::revoke_client(channel, fingerprint).await,
+    }
 }
 
 // ============================================================================
-// Commands
+// Task Commands
 // ============================================================================
 
-async fn cmd_run(
-    client: &mut ContinuumClient<Channel>,
+async fn cmd_run<T>(
+    client: &mut ContinuumClient<T>,
     cli: &Cli,
     interactive: bool,
     name: Option<String>,
     cwd: Option<PathBuf>,
     envs: Vec<String>,
     cmd: Vec<String>,
-) -> Result<()> {
+) -> Result<()>
+where
+    T: tonic::client::GrpcService<tonic::body::BoxBody> + Clone + Send + 'static,
+    T::ResponseBody: tonic::codegen::Body<Data = tonic::codegen::Bytes> + Send + 'static,
+    T::Error: Into<tonic::codegen::StdError>,
+    <T::ResponseBody as tonic::codegen::Body>::Error: Into<tonic::codegen::StdError> + Send,
+    T::Future: Send,
+{
     // Parse environment variables
     let env: std::collections::HashMap<String, String> = envs
         .into_iter()
@@ -340,13 +607,20 @@ async fn cmd_run(
     Ok(())
 }
 
-async fn cmd_ls(
-    client: &mut ContinuumClient<Channel>,
+async fn cmd_ls<T>(
+    client: &mut ContinuumClient<T>,
     cli: &Cli,
     status: Option<StatusFilter>,
     recent: i32,
     all: bool,
-) -> Result<()> {
+) -> Result<()>
+where
+    T: tonic::client::GrpcService<tonic::body::BoxBody> + Clone + Send + 'static,
+    T::ResponseBody: tonic::codegen::Body<Data = tonic::codegen::Bytes> + Send + 'static,
+    T::Error: Into<tonic::codegen::StdError>,
+    <T::ResponseBody as tonic::codegen::Body>::Error: Into<tonic::codegen::StdError> + Send,
+    T::Future: Send,
+{
     let request = ListTasksRequest {
         status_filter: status.as_ref().map(|s| s.to_proto()),
         limit: if all { None } else { Some(recent) },
@@ -390,12 +664,19 @@ async fn cmd_ls(
     Ok(())
 }
 
-async fn cmd_show(
-    client: &mut ContinuumClient<Channel>,
+async fn cmd_show<T>(
+    client: &mut ContinuumClient<T>,
     cli: &Cli,
     task_id: String,
     tail: Option<usize>,
-) -> Result<()> {
+) -> Result<()>
+where
+    T: tonic::client::GrpcService<tonic::body::BoxBody> + Clone + Send + 'static,
+    T::ResponseBody: tonic::codegen::Body<Data = tonic::codegen::Bytes> + Send + 'static,
+    T::Error: Into<tonic::codegen::StdError>,
+    <T::ResponseBody as tonic::codegen::Body>::Error: Into<tonic::codegen::StdError> + Send,
+    T::Future: Send,
+{
     let request = GetTaskRequest {
         task_id: task_id.clone(),
     };
@@ -471,13 +752,20 @@ async fn cmd_show(
     Ok(())
 }
 
-async fn cmd_attach(
-    client: &mut ContinuumClient<Channel>,
+async fn cmd_attach<T>(
+    client: &mut ContinuumClient<T>,
     _cli: &Cli,
     task_id: String,
     interactive: bool,
     no_follow: bool,
-) -> Result<()> {
+) -> Result<()>
+where
+    T: tonic::client::GrpcService<tonic::body::BoxBody> + Clone + Send + 'static,
+    T::ResponseBody: tonic::codegen::Body<Data = tonic::codegen::Bytes> + Send + 'static,
+    T::Error: Into<tonic::codegen::StdError>,
+    <T::ResponseBody as tonic::codegen::Body>::Error: Into<tonic::codegen::StdError> + Send,
+    T::Future: Send,
+{
     // First verify task exists
     let get_request = GetTaskRequest {
         task_id: task_id.clone(),
@@ -652,8 +940,6 @@ async fn cmd_attach(
 
 /// Wait for a single keypress (used after task exits).
 fn wait_for_keypress() {
-    use std::os::fd::AsRawFd;
-
     let fd = std::io::stdin().as_raw_fd();
 
     // Check if stdin is a TTY
@@ -741,10 +1027,36 @@ async fn forward_stdin(
     task_id: String,
     detach_tx: tokio::sync::oneshot::Sender<()>,
 ) -> StdinResult {
-    let mut client = match connect(&daemon_addr).await {
-        Ok(c) => c,
-        Err(e) => return StdinResult::Error(e),
-    };
+    // Use local ad-hoc for local connections, enrolled for remote
+    if is_local_address(&daemon_addr) {
+        match connect_local_adhoc(&daemon_addr).await {
+            Ok(mut client) => {
+                forward_stdin_with_client(&mut client, task_id, detach_tx).await
+            }
+            Err(e) => StdinResult::Error(e),
+        }
+    } else {
+        match connect_authenticated(&daemon_addr).await {
+            Ok(mut client) => {
+                forward_stdin_with_client(&mut client, task_id, detach_tx).await
+            }
+            Err(e) => StdinResult::Error(e),
+        }
+    }
+}
+
+async fn forward_stdin_with_client<T>(
+    client: &mut ContinuumClient<T>,
+    task_id: String,
+    detach_tx: tokio::sync::oneshot::Sender<()>,
+) -> StdinResult
+where
+    T: tonic::client::GrpcService<tonic::body::BoxBody> + Clone + Send + 'static,
+    T::ResponseBody: tonic::codegen::Body<Data = tonic::codegen::Bytes> + Send + 'static,
+    T::Error: Into<tonic::codegen::StdError>,
+    <T::ResponseBody as tonic::codegen::Body>::Error: Into<tonic::codegen::StdError> + Send,
+    T::Future: Send,
+{
     let mut stdin = tokio::io::stdin();
     let mut escape = EscapeDetector::new();
 
@@ -783,14 +1095,21 @@ async fn forward_stdin(
     }
 }
 
-async fn cmd_send(
-    client: &mut ContinuumClient<Channel>,
+async fn cmd_send<T>(
+    client: &mut ContinuumClient<T>,
     task_id: String,
     data: Option<String>,
     file: Option<PathBuf>,
     ctrl_c: bool,
     raw: bool,
-) -> Result<()> {
+) -> Result<()>
+where
+    T: tonic::client::GrpcService<tonic::body::BoxBody> + Clone + Send + 'static,
+    T::ResponseBody: tonic::codegen::Body<Data = tonic::codegen::Bytes> + Send + 'static,
+    T::Error: Into<tonic::codegen::StdError>,
+    <T::ResponseBody as tonic::codegen::Body>::Error: Into<tonic::codegen::StdError> + Send,
+    T::Future: Send,
+{
     let mut bytes = if ctrl_c {
         // Ctrl+C = ASCII 0x03
         vec![0x03]
@@ -823,11 +1142,18 @@ async fn cmd_send(
     Ok(())
 }
 
-async fn cmd_cancel(
-    client: &mut ContinuumClient<Channel>,
+async fn cmd_cancel<T>(
+    client: &mut ContinuumClient<T>,
     task_id: String,
     force: bool,
-) -> Result<()> {
+) -> Result<()>
+where
+    T: tonic::client::GrpcService<tonic::body::BoxBody> + Clone + Send + 'static,
+    T::ResponseBody: tonic::codegen::Body<Data = tonic::codegen::Bytes> + Send + 'static,
+    T::Error: Into<tonic::codegen::StdError>,
+    <T::ResponseBody as tonic::codegen::Body>::Error: Into<tonic::codegen::StdError> + Send,
+    T::Future: Send,
+{
     let request = CancelTaskRequest { task_id, force };
 
     client
@@ -868,11 +1194,7 @@ fn truncate(s: &str, max: usize) -> String {
 }
 
 fn format_timestamp(ms: i64) -> String {
-    use chrono::{TimeZone, Utc};
-    Utc.timestamp_millis_opt(ms)
-        .single()
-        .map(|dt| dt.format("%Y-%m-%d %H:%M:%S UTC").to_string())
-        .unwrap_or_else(|| "invalid".to_string())
+    utils::format_timestamp_millis(ms)
 }
 
 fn task_to_json(task: &TaskView) -> serde_json::Value {

@@ -1,0 +1,115 @@
+syntax = "proto3";
+
+package continuum.enrollment.v1;
+
+// Enrollment service for client registration.
+//
+// Flow:
+// 1. Admin calls InitiateEnrollment on daemon to get a token
+// 2. Client calls CompleteEnrollment with token + public key
+// 3. If same-machine trust is present, auto-approved
+// 4. Client receives server certificate for pinning
+service EnrollmentService {
+    // Initiate enrollment - returns a token for the client to present
+    rpc InitiateEnrollment(InitiateEnrollmentRequest) returns (InitiateEnrollmentResponse);
+
+    // Complete enrollment - client presents token and public key
+    rpc CompleteEnrollment(CompleteEnrollmentRequest) returns (CompleteEnrollmentResponse);
+
+    // Check enrollment status (for async approval flows)
+    rpc GetEnrollmentStatus(GetEnrollmentStatusRequest) returns (GetEnrollmentStatusResponse);
+
+    // === Agent-Native APIs (programmatic access) ===
+
+    // List all authorized clients (for automation/dashboards)
+    rpc ListAuthorizedClients(ListAuthorizedClientsRequest) returns (ListAuthorizedClientsResponse);
+
+    // Revoke a client's authorization
+    rpc RevokeClient(RevokeClientRequest) returns (RevokeClientResponse);
+}
+
+message InitiateEnrollmentRequest {
+    // Optional label for this enrollment (e.g., "laptop", "phone")
+    string label = 1;
+    // Validity period in seconds (default: 300 = 5 minutes, max: 3600)
+    uint32 validity_seconds = 2;
+}
+
+message InitiateEnrollmentResponse {
+    // The enrollment token (base64-encoded)
+    string token = 1;
+    // Human-readable display string (chunked for readability)
+    string display_string = 2;
+    // Expiration timestamp (Unix seconds)
+    int64 expires_at = 3;
+}
+
+message CompleteEnrollmentRequest {
+    // The enrollment token (base64-encoded)
+    string token = 1;
+    // Client's Ed25519 public key (32 bytes)
+    bytes public_key = 2;
+    // Optional same-machine proof (SHA256 hash of local trust file content)
+    bytes local_trust_proof = 3;
+    // Client's self-signed certificate (DER-encoded X.509)
+    bytes client_cert_der = 4;
+}
+
+message CompleteEnrollmentResponse {
+    enum Status {
+        STATUS_UNKNOWN = 0;
+        STATUS_APPROVED = 1;
+        STATUS_PENDING_APPROVAL = 2;
+        STATUS_REJECTED = 3;
+    }
+    Status status = 1;
+    // Server's certificate for pinning (DER-encoded X.509)
+    bytes server_cert_der = 2;
+    // Client's fingerprint (SHA256:base64, for confirmation)
+    string client_fingerprint = 3;
+    // Rejection reason (if status == STATUS_REJECTED)
+    string rejection_reason = 4;
+}
+
+message GetEnrollmentStatusRequest {
+    // Client fingerprint to check
+    string client_fingerprint = 1;
+}
+
+message GetEnrollmentStatusResponse {
+    // Whether the client is currently authorized
+    bool is_authorized = 1;
+    // When authorization was granted (Unix seconds, 0 if not authorized)
+    int64 authorized_at = 2;
+}
+
+// === Agent-Native API Messages ===
+
+message ListAuthorizedClientsRequest {
+    // Empty - lists all clients
+}
+
+message ListAuthorizedClientsResponse {
+    repeated AuthorizedClient clients = 1;
+}
+
+message AuthorizedClient {
+    // Client fingerprint (SHA256:base64)
+    string fingerprint = 1;
+    // Optional label set during enrollment
+    string label = 2;
+    // When the client was authorized (Unix seconds)
+    int64 authorized_at = 3;
+    // Last time the client connected (Unix seconds)
+    int64 last_seen_at = 4;
+}
+
+message RevokeClientRequest {
+    // Fingerprint of client to revoke
+    string fingerprint = 1;
+}
+
+message RevokeClientResponse {
+    // Whether revocation succeeded
+    bool success = 1;
+}
