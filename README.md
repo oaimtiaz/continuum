@@ -10,9 +10,7 @@ Tasks die when you close your laptop, lose a terminal, or walk away. You have to
 
 ## The Solution
 
-Continuum makes long-running work survivable. Start work on one machine, check progress from your phone, approve prompts, and resume exactly where you left off—without SSH gymnastics or babysitting sessions.
-
-**Mental model:** _"My work lives on a machine, not in a session."_
+Continuum makes long-running work survivable. Start work on one machine, check progress from your phone, approve prompts, and resume exactly where you left off, without needing to hover over your device.
 
 ## Key Features
 
@@ -48,8 +46,9 @@ RUST_LOG=info ./target/release/continuum-daemon
 ```
 
 The daemon listens on two ports:
-- **Port 50051**: Enrollment service (server-auth TLS only)
-- **Port 50052**: Main API (mTLS required)
+
+-   **Port 50051**: Enrollment service (server-auth TLS only)
+-   **Port 50052**: Main API (mTLS required)
 
 ### Enroll a Client
 
@@ -238,7 +237,7 @@ Pure domain types and business logic. Intentionally IO-free:
 
 ### `continuum-auth`
 
-Pure authentication library. Also IO-free—all persistence is injected via traits:
+Pure authentication library. Also IO-free, all persistence is injected via traits:
 
 -   Ed25519 keypairs with secure memory handling
 -   Signed enrollment tokens (no TOFU)

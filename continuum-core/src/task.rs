@@ -89,7 +89,7 @@ pub enum Stream {
 /// Attention state indicating whether a running task needs user attention.
 ///
 /// This is an overlay on top of `TaskStatus::Running`, NOT a lifecycle state.
-/// A task can be `Running` with `AttentionState::NeedsInput` — for UX purposes
+/// A task can be `Running` with `AttentionState::NeedsInput`, for UX purposes
 /// this might display as "Waiting", but the underlying status remains `Running`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "state")]

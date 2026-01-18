@@ -6,7 +6,7 @@ Before you can run tasks on a Continuum daemon, your device must be enrolled. Th
 
 ## Local Enrollment (Same Machine)
 
-If you're running the CLI on the same machine as the daemon, use local enrollment—no token required:
+If you're running the CLI on the same machine as the daemon, use local enrollment (no token required):
 
 ```bash
 continuum enroll --local
@@ -17,8 +17,8 @@ This works by reading a shared secret from the filesystem that only local proces
 ### How It Works
 
 1. The daemon writes trust files to `$XDG_RUNTIME_DIR/continuum/`:
-   - `server-fingerprint` — the daemon's identity
-   - `local-trust-token` — a 32-byte secret
+    - `server-fingerprint` — the daemon's identity
+    - `local-trust-token` — a 32-byte secret
 2. The CLI reads these files and sends a proof (SHA256 of the token) to the daemon
 3. The daemon verifies the proof and approves enrollment
 
@@ -26,8 +26,8 @@ This works by reading a shared secret from the filesystem that only local proces
 
 Local enrollment requires `$XDG_RUNTIME_DIR` to be set:
 
-- **Linux**: Usually set automatically by systemd to `/run/user/$UID`
-- **macOS**: Not set by default—see [Troubleshooting](#troubleshooting)
+-   **Linux**: Usually set automatically by systemd to `/run/user/$UID`
+-   **macOS**: Not set by default—see [Troubleshooting](#troubleshooting)
 
 ---
 
@@ -39,8 +39,8 @@ For remote enrollment or when local enrollment isn't available:
 
 Ask your administrator for an enrollment token. They will:
 
-- Generate a token on the machine running the daemon
-- Share it with you (via Slack, email, in person, etc.)
+-   Generate a token on the machine running the daemon
+-   Share it with you (via Slack, email, in person, etc.)
 
 Tokens look like: `AQAA-xxxx-xxxx-xxxx-...`
 
@@ -94,6 +94,7 @@ Then restart your terminal and the daemon.
 **"Server fingerprint not found. Is the daemon running locally?"**
 
 The daemon hasn't written its fingerprint file yet. Ensure:
+
 1. The daemon is running
 2. `$XDG_RUNTIME_DIR` is set for both daemon and CLI
 3. Check that `$XDG_RUNTIME_DIR/continuum/server-fingerprint` exists
@@ -101,6 +102,7 @@ The daemon hasn't written its fingerprint file yet. Ensure:
 **"Local trust proof not available."**
 
 The CLI can't read the trust token. Check:
+
 1. The daemon is running on the same machine
 2. Both processes use the same `$XDG_RUNTIME_DIR`
 3. File permissions allow your user to read `$XDG_RUNTIME_DIR/continuum/local-trust-token`
@@ -133,8 +135,8 @@ The token will be displayed locally. Share it with the user through a secure out
 
 Options:
 
-- `--label <name>` - Label to identify who/what is enrolling
-- `--validity <duration>` - How long the token is valid (default: 5m, max: 1h)
+-   `--label <name>` - Label to identify who/what is enrolling
+-   `--validity <duration>` - How long the token is valid (default: 5m, max: 1h)
 
 ### Managing Enrolled Clients
 
@@ -152,8 +154,8 @@ continuum clients revoke SHA256:xxxx...
 
 ### Security Notes
 
-- **Token = Authorization**: A valid enrollment token is sufficient for authorization. No additional approval is needed.
-- Tokens are cryptographically signed and single-use
-- Tokens contain the server's identity, preventing man-in-the-middle attacks
-- Same-machine detection is logged for auditing but does not affect authorization
-- Remote enrollment requires out-of-band token sharing for security
+-   **Token = Authorization**: A valid enrollment token is sufficient for authorization. No additional approval is needed.
+-   Tokens are cryptographically signed and single-use
+-   Tokens contain the server's identity, preventing man-in-the-middle attacks
+-   Same-machine detection is logged for auditing but does not affect authorization
+-   Remote enrollment requires out-of-band token sharing for security

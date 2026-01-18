@@ -3,7 +3,6 @@
 ## User Guides
 
 - [Device Enrollment](./enrollment.md) — How to enroll a new device with the daemon
-
 ## Architecture
 
 - [Auth Overview](./continuum-auth/00_Overview.md) — Authentication design and identity model
