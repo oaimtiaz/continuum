@@ -21,11 +21,11 @@ use continuum_proto::{
 };
 
 use convert::{output_chunk_to_proto, task_to_view};
+use tokio::net::TcpListener;
 use tokio::signal;
+use tokio_rustls::TlsAcceptor;
 use tokio_stream::Stream;
 use tonic::{transport::Server, Request, Response, Status};
-use tokio::net::TcpListener;
-use tokio_rustls::TlsAcceptor;
 use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
 
@@ -389,20 +389,14 @@ async fn cmd_token(action: TokenAction) -> Result<(), Box<dyn std::error::Error>
 
             // Store token hash in database (so CompleteEnrollment can validate it)
             let auth_db_path = data_dir.join("auth.db");
-            let auth_pool = sqlx::SqlitePool::connect(&format!(
-                "sqlite:{}?mode=rwc",
-                auth_db_path.display()
-            ))
-            .await?;
+            let auth_pool =
+                sqlx::SqlitePool::connect(&format!("sqlite:{}?mode=rwc", auth_db_path.display()))
+                    .await?;
             let (auth_store, _tls_reload_rx) = AuthStore::new(auth_pool).await?;
 
             let token_hash = hash_token(&token_base64);
             auth_store
-                .create_enrollment_token(
-                    &token_hash,
-                    label.as_deref(),
-                    token.expires_at(),
-                )
+                .create_enrollment_token(&token_hash, label.as_deref(), token.expires_at())
                 .await?;
 
             // Display token
@@ -446,7 +440,9 @@ fn parse_duration(s: &str) -> Result<u32, Box<dyn std::error::Error>> {
         (s, 1)
     };
 
-    let num: u32 = num_str.parse().map_err(|_| format!("Invalid duration: {}", s))?;
+    let num: u32 = num_str
+        .parse()
+        .map_err(|_| format!("Invalid duration: {}", s))?;
     let secs = num.saturating_mul(unit);
 
     // Clamp to valid range (1 minute to 1 hour)
@@ -482,7 +478,8 @@ async fn cmd_serve() -> Result<(), Box<dyn std::error::Error>> {
 
     // Initialize auth store with TLS reload channel
     let auth_db_path = data_dir.join("auth.db");
-    let auth_pool = sqlx::SqlitePool::connect(&format!("sqlite:{}?mode=rwc", auth_db_path.display())).await?;
+    let auth_pool =
+        sqlx::SqlitePool::connect(&format!("sqlite:{}?mode=rwc", auth_db_path.display())).await?;
     let (auth_store, tls_reload_rx) = AuthStore::new(auth_pool).await?;
     let auth_store = Arc::new(auth_store);
     tracing::info!("Auth store initialized with TLS reload channel");
@@ -513,7 +510,8 @@ async fn cmd_serve() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     // Initialize same-machine trust
-    let server_fingerprint = continuum_auth::identity::Fingerprint::from_public_key(&server_key.public_key());
+    let server_fingerprint =
+        continuum_auth::identity::Fingerprint::from_public_key(&server_key.public_key());
     let local_trust_manager: Option<Arc<LocalTrustManager>> = match LocalTrustManager::new() {
         Ok(manager) => {
             // Write server fingerprint for local enrollment
@@ -551,7 +549,7 @@ async fn cmd_serve() -> Result<(), Box<dyn std::error::Error>> {
         supervisor,
     };
 
-    // Create enrollment service with rate limiting (M3 FIX)
+    // Create enrollment service with rate limiting
     let rate_limiter = EnrollmentRateLimiter::default();
     let rate_limit_interceptor = RateLimitInterceptor::new(rate_limiter);
     let enrollment_service = EnrollmentServiceImpl::new(
@@ -575,43 +573,43 @@ async fn cmd_serve() -> Result<(), Box<dyn std::error::Error>> {
     // 1. Valid same-machine proof in metadata (local trust)
     // 2. Valid mTLS client fingerprint (remote enrolled clients)
     let trust_manager_for_interceptor = local_trust_manager.clone();
-    let auth_interceptor = move |req: tonic::Request<()>| -> Result<tonic::Request<()>, tonic::Status> {
-        // Check for valid same-machine proof in metadata (highest priority)
-        if let Some(ref manager) = trust_manager_for_interceptor {
-            if let Some(proof_header) = req.metadata().get_bin("x-local-trust-proof-bin") {
-                if let Ok(proof_bytes) = proof_header.to_bytes() {
-                    if manager.verify_proof(proof_bytes.as_ref()) {
-                        return Ok(req); // Valid local proof
+    let auth_interceptor =
+        move |req: tonic::Request<()>| -> Result<tonic::Request<()>, tonic::Status> {
+            // Check for valid same-machine proof in metadata (highest priority)
+            if let Some(ref manager) = trust_manager_for_interceptor {
+                if let Some(proof_header) = req.metadata().get_bin("x-local-trust-proof-bin") {
+                    if let Ok(proof_bytes) = proof_header.to_bytes() {
+                        if manager.verify_proof(proof_bytes.as_ref()) {
+                            return Ok(req); // Valid local proof
+                        }
                     }
                 }
             }
-        }
 
-        // Check for mTLS client certificate fingerprint
-        // The TlsConnectInfo is available via request extensions when using mTLS
-        if let Some(connect_info) = req.extensions().get::<tls_io::TlsConnectInfo>() {
-            if let Some(ref fingerprint) = connect_info.client_fingerprint {
-                // Use cached authorization check for performance
-                if auth_store_for_interceptor.is_authorized_cached(fingerprint) {
-                    return Ok(req); // Valid mTLS client
+            // Check for mTLS client certificate fingerprint
+            // The TlsConnectInfo is available via request extensions when using mTLS
+            if let Some(connect_info) = req.extensions().get::<tls_io::TlsConnectInfo>() {
+                if let Some(ref fingerprint) = connect_info.client_fingerprint {
+                    // Use cached authorization check for performance
+                    if auth_store_for_interceptor.is_authorized_cached(fingerprint) {
+                        return Ok(req); // Valid mTLS client
+                    }
                 }
             }
-        }
 
-        Err(tonic::Status::unauthenticated("Valid authentication required"))
-    };
+            Err(tonic::Status::unauthenticated(
+                "Valid authentication required",
+            ))
+        };
 
     // Wrap ContinuumServer with auth interceptor
     let continuum_with_auth = ContinuumServer::with_interceptor(service, auth_interceptor);
 
     // Enrollment server (port 50051) - only enrollment service, no auth required
     // M3 FIX: Rate limiting applied to prevent DoS and brute-force attacks
-    let enrollment_server = Server::builder()
-        .add_service(reflection)
-        .add_service(EnrollmentServiceServer::with_interceptor(
-            enrollment_service,
-            rate_limit_interceptor,
-        ));
+    let enrollment_server = Server::builder().add_service(reflection).add_service(
+        EnrollmentServiceServer::with_interceptor(enrollment_service, rate_limit_interceptor),
+    );
 
     // Main API server (port 50052) - requires mTLS or local proof
     let main_server = Server::builder()
@@ -634,7 +632,8 @@ async fn cmd_serve() -> Result<(), Box<dyn std::error::Error>> {
         auth_store,
         server_identity,
         tls_reload_rx,
-    ).await;
+    )
+    .await;
 
     match shutdown_result {
         Ok(()) => {
@@ -650,6 +649,9 @@ async fn cmd_serve() -> Result<(), Box<dyn std::error::Error>> {
 
 // Wrapper type for TLS streams that implements tonic's Connected trait
 mod tls_io {
+    use continuum_auth::cert::extract_public_key_from_cert;
+    use continuum_auth::identity::Fingerprint;
+    use sha2::{Digest, Sha256};
     use std::io;
     use std::net::SocketAddr;
     use std::pin::Pin;
@@ -658,9 +660,6 @@ mod tls_io {
     use tokio::net::TcpStream;
     use tokio_rustls::server::TlsStream;
     use tonic::transport::server::Connected;
-    use continuum_auth::identity::Fingerprint;
-    use continuum_auth::cert::extract_public_key_from_cert;
-    use sha2::{Digest, Sha256};
 
     // Re-export TlsConnectInfo from the shared tls module
     pub use crate::tls::TlsConnectInfo;
@@ -921,11 +920,8 @@ async fn run_dual_port_servers(
             .await
     });
 
-    let main_handle = tokio::spawn(async move {
-        main_server
-            .serve_with_incoming(main_incoming)
-            .await
-    });
+    let main_handle =
+        tokio::spawn(async move { main_server.serve_with_incoming(main_incoming).await });
 
     // Wait for either server to finish (or both on shutdown)
     tokio::select! {

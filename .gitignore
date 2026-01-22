@@ -3,3 +3,5 @@ Cargo.lock
 /tmp
 
 .obsidian
+
+*.code-workspace

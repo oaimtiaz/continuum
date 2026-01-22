@@ -40,6 +40,9 @@ subtle = { workspace = true }
 x509-parser = "0.17"
 zeroize = { workspace = true }
 
+# Relay message definitions
+continuum-relay-proto = { workspace = true }
+
 # Persistence
 serde = { workspace = true }
 toml = { workspace = true }

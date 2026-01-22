@@ -34,6 +34,9 @@ rustls = { workspace = true }
 tokio-rustls = { workspace = true }
 rustls-pemfile = { workspace = true }
 
+# Relay message definitions
+continuum-relay-proto = { workspace = true }
+
 # Auth support
 arc-swap = "1.7"
 dashmap = "6"
