@@ -4,9 +4,20 @@ version = "0.1.0"
 edition = "2021"
 license = "Apache-2.0"
 
+[features]
+default = []
+relay = ["reqwest", "bytes", "thiserror", "tokio", "tracing"]
+
 [dependencies]
 base64 = { workspace = true }
 chrono = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 uuid = { workspace = true }
+
+# Optional relay dependencies (enabled by "relay" feature)
+reqwest = { workspace = true, optional = true }
+bytes = { workspace = true, optional = true }
+thiserror = { workspace = true, optional = true }
+tokio = { workspace = true, optional = true, features = ["io-util", "sync", "time"] }
+tracing = { version = "0.1", optional = true }

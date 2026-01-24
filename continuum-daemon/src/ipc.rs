@@ -174,28 +174,74 @@ async fn process_shim_message(
                 "Attention signal"
             );
 
+            // Convert optional context to Vec for AttentionState
+            let reasons: Vec<String> = attention.context.clone().into_iter().collect();
+
             // Map shim attention kinds to core AttentionState
-            let state = match kind {
-                AttentionKind::Unspecified => AttentionState::None,
-                AttentionKind::MaybeNeedsInput => AttentionState::NeedsInput {
-                    confidence: 0.5,
-                    reasons: attention.context.into_iter().collect(),
-                },
-                AttentionKind::NeedsInput => AttentionState::NeedsInput {
-                    confidence: 0.9,
-                    reasons: attention.context.into_iter().collect(),
-                },
-                AttentionKind::Stalled => AttentionState::PossiblyStuck {
-                    idle_seconds: 30, // Placeholder, shim could provide this
-                },
-                AttentionKind::Error => AttentionState::NeedsInput {
-                    confidence: 1.0,
-                    reasons: vec!["Error detected".to_string()],
-                },
+            let (state, should_notify, urgent) = match kind {
+                AttentionKind::Unspecified => (AttentionState::None, false, false),
+                AttentionKind::MaybeNeedsInput => (
+                    AttentionState::NeedsInput {
+                        confidence: 0.5,
+                        reasons: reasons.clone(),
+                    },
+                    false, // Low confidence, don't spam notifications
+                    false,
+                ),
+                AttentionKind::NeedsInput => (
+                    AttentionState::NeedsInput {
+                        confidence: 0.9,
+                        reasons: reasons.clone(),
+                    },
+                    true, // High confidence, notify
+                    false,
+                ),
+                AttentionKind::Stalled => (
+                    AttentionState::PossiblyStuck {
+                        idle_seconds: 30, // Placeholder, shim could provide this
+                    },
+                    true,
+                    false,
+                ),
+                AttentionKind::Error => (
+                    AttentionState::NeedsInput {
+                        confidence: 1.0,
+                        reasons: vec!["Error detected".to_string()],
+                    },
+                    true,
+                    true, // Errors are urgent
+                ),
             };
 
             let event = TaskEvent::new(TaskEventKind::AttentionChanged { state });
             store.apply_event(task_id, event).await?;
+
+            // Forward to relay for push notification (if connected and warranted)
+            if should_notify {
+                if let Some(relay_handle) = store.relay_handle().await {
+                    let message = attention.context.clone().unwrap_or_else(|| {
+                        format!("Task {} needs attention", task_id.0)
+                    });
+
+                    // Use task_id as session_id for attention tracking
+                    if let Err(e) = relay_handle
+                        .request_attention(&task_id.0.to_string(), &message, urgent)
+                        .await
+                    {
+                        tracing::warn!(
+                            task = %task_id.0,
+                            error = %e,
+                            "Failed to send attention request to relay"
+                        );
+                    } else {
+                        tracing::debug!(
+                            task = %task_id.0,
+                            urgent = urgent,
+                            "Forwarded attention to relay"
+                        );
+                    }
+                }
+            }
         }
 
         Some(shim_to_daemon::Msg::Exited(exited)) => {

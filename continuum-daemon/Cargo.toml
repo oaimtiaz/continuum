@@ -9,7 +9,7 @@ anyhow = { workspace = true }
 clap = { workspace = true }
 uuid = { workspace = true }
 chrono = { workspace = true }
-continuum-core = { path = "../continuum-core" }
+continuum-core = { path = "../continuum-core", features = ["relay"] }
 continuum-proto = { path = "../continuum-proto" }
 continuum-shim-proto = { path = "../continuum-shim-proto" }
 continuum-auth = { path = "../continuum-auth" }
@@ -27,6 +27,7 @@ tonic-reflection = "0.12"
 sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite", "macros", "migrate"] }
 serde_json = { workspace = true }
 dirs = "5.0"
+dotenvy = { workspace = true }
 
 # TLS and certificates
 rcgen = { workspace = true }
@@ -39,6 +40,7 @@ continuum-relay-proto = { workspace = true }
 
 # Auth support
 arc-swap = "1.7"
+rand = { workspace = true }
 dashmap = "6"
 sha2 = "0.10"
 hex = "0.4"

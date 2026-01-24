@@ -18,6 +18,7 @@ use tonic::transport::Channel;
 use trust::TrustStore;
 
 mod commands;
+mod relay;
 mod tls;
 mod trust;
 mod utils;
@@ -37,22 +38,18 @@ impl RawModeGuard {
     fn enter() -> Option<Self> {
         let fd = std::io::stdin().as_raw_fd();
 
-        // Check if stdin is a TTY
         if unsafe { libc::isatty(fd) } != 1 {
             return None;
         }
 
-        // Get current settings
         let mut original: libc::termios = unsafe { std::mem::zeroed() };
         if unsafe { libc::tcgetattr(fd, &mut original) } != 0 {
             return None;
         }
 
-        // Create raw mode settings
         let mut raw = original;
         unsafe { libc::cfmakeraw(&mut raw) };
 
-        // Apply raw mode
         if unsafe { libc::tcsetattr(fd, libc::TCSANOW, &raw) } != 0 {
             return None;
         }
@@ -63,7 +60,6 @@ impl RawModeGuard {
 
 impl Drop for RawModeGuard {
     fn drop(&mut self) {
-        // Restore original settings
         unsafe { libc::tcsetattr(self.fd, libc::TCSANOW, &self.original) };
     }
 }
@@ -75,6 +71,22 @@ struct Cli {
     /// Daemon address (port 50052 for main API, 50051 for enrollment)
     #[arg(long, default_value = "http://127.0.0.1:50052", global = true)]
     daemon: String,
+
+    /// Connect to daemon via relay (requires CONTINUUM_RELAY_* env vars)
+    #[arg(long, global = true)]
+    via_relay: bool,
+
+    /// Daemon ID for relay connection (defaults to daemon address if not set)
+    #[arg(long, global = true, requires = "via_relay")]
+    relay_daemon_id: Option<String>,
+
+    /// Skip relay Auth0 authentication (dev mode - requires relay to also be in dev mode)
+    #[arg(long, global = true, hide = true)]
+    relay_no_auth: bool,
+
+    /// Relay endpoint override (for local development)
+    #[arg(long, global = true, hide = true)]
+    relay_endpoint: Option<String>,
 
     /// Output JSON instead of human-readable text
     #[arg(long, global = true)]
@@ -210,6 +222,20 @@ enum Commands {
         #[command(subcommand)]
         action: ClientsAction,
     },
+
+    /// Generate an enrollment token remotely (requires enrollment)
+    ///
+    /// Allows enrolled clients to generate tokens for others to enroll.
+    /// Rate limited to 3 live tokens per daemon.
+    GenerateToken {
+        /// Target daemon fingerprint (e.g., SHA256:abc...)
+        #[arg(long)]
+        daemon: String,
+
+        /// Human-readable label for the token
+        #[arg(long, short)]
+        label: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -247,6 +273,8 @@ impl StatusFilter {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    dotenvy::dotenv().ok();
+
     let cli = Cli::parse();
 
     let result = run(cli).await;
@@ -260,36 +288,61 @@ async fn main() -> Result<()> {
 }
 
 async fn run(cli: Cli) -> Result<()> {
-    // Handle commands that don't need a task client connection
-    match &cli.command {
-        Commands::Enroll { token, label, local } => {
-            // Enrollment uses port 50051 (server-auth only, no mTLS)
-            let enrollment_addr = to_enrollment_addr(&cli.daemon);
-            if *local {
-                return cmd_enroll_local(&enrollment_addr, label.as_deref()).await;
-            } else {
-                let token = token
-                    .as_ref()
-                    .ok_or_else(|| anyhow::anyhow!("Token required (or use --local)"))?;
-                return cmd_enroll(&enrollment_addr, token, label.as_deref()).await;
-            }
+    // Handle enrollment separately (doesn't use relay - needs direct daemon access)
+    if let Commands::Enroll { token, label, local } = &cli.command {
+        let enrollment_addr = to_enrollment_addr(&cli.daemon);
+        if *local {
+            return cmd_enroll_local(&enrollment_addr, label.as_deref()).await;
+        } else {
+            let token = token
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("Token required (or use --local)"))?;
+            return cmd_enroll(&enrollment_addr, token, label.as_deref()).await;
         }
+    }
+
+    // Check for relay mode - routes all other commands through relay
+    if cli.via_relay {
+        return run_via_relay(&cli).await;
+    }
+
+    // Direct connection: handle commands that don't need a task client
+    match &cli.command {
         Commands::Status => {
             return cmd_status(&cli.daemon).await;
         }
         Commands::Clients { action } => {
             return cmd_clients(&cli, action).await;
         }
+        Commands::GenerateToken { daemon, label } => {
+            // GenerateToken always uses relay (connect to target daemon remotely)
+            return cmd_generate_token(&cli, daemon, label.as_deref()).await;
+        }
         _ => {}
     }
 
-    // For local connections, use ad-hoc mode (sends local proof header)
-    // For remote connections, use enrolled mode (mTLS)
+    // For local connections, try ad-hoc first (fastest), fall back to enrolled mTLS
+    // For remote connections, use enrolled mode (mTLS) only
     if is_local_address(&cli.daemon) {
+        // Try local ad-hoc first (no cert loading, uses runtime dir proof)
         match connect_local_adhoc(&cli.daemon).await {
-            Ok(mut client) => run_task_commands(&mut client, &cli).await,
+            Ok(mut client) => return run_task_commands(&mut client, &cli).await,
             Err(local_err) => {
-                Err(local_err.context("Local connection failed. Is the daemon running?"))
+                // Local ad-hoc failed - fall back to enrolled mTLS if available
+                // This handles macOS (no runtime dir) and other platforms gracefully
+                match connect_authenticated(&cli.daemon).await {
+                    Ok(mut client) => return run_task_commands(&mut client, &cli).await,
+                    Err(auth_err) => {
+                        // Both methods failed - show what was tried
+                        Err(anyhow::anyhow!(
+                            "Connection failed to local daemon.\n\n\
+                             Tried local ad-hoc: {:#}\n\n\
+                             Tried enrolled mTLS: {:#}\n\n\
+                             To fix: run 'continuum enroll -t <token>' or 'continuum enroll --local'",
+                            local_err, auth_err
+                        ))
+                    }
+                }
             }
         }
     } else {
@@ -298,6 +351,42 @@ async fn run(cli: Cli) -> Result<()> {
             Ok(mut client) => run_task_commands(&mut client, &cli).await,
             Err(err) => Err(err.context("Not enrolled with remote daemon")),
         }
+    }
+}
+
+/// Run commands via relay connection.
+async fn run_via_relay(cli: &Cli) -> Result<()> {
+    // Get daemon ID from CLI flag or environment
+    let daemon_id = cli
+        .relay_daemon_id
+        .clone()
+        .or_else(|| std::env::var("CONTINUUM_RELAY_DAEMON_ID").ok())
+        .context("--relay-daemon-id or CONTINUUM_RELAY_DAEMON_ID required")?;
+
+    // Build relay config
+    let mut config = relay::RelayConfig::from_env()
+        .context("CONTINUUM_RELAY_ENDPOINT required")?;
+
+    // Apply CLI overrides
+    config = config
+        .with_endpoint(cli.relay_endpoint.clone())
+        .with_no_auth(cli.relay_no_auth);
+
+    eprintln!("Connecting to daemon {} via relay...", daemon_id);
+
+    // Connect via relay
+    let mut client = relay::connect_via_relay(&config, &daemon_id).await?;
+
+    eprintln!("Connected!");
+
+    // Handle commands
+    match &cli.command {
+        Commands::Status => {
+            // For relay mode, successful mTLS connection proves we're authorized
+            eprintln!("✓ Client is authorized (connected via relay)");
+            Ok(())
+        }
+        _ => run_task_commands(&mut client, cli).await,
     }
 }
 
@@ -312,7 +401,10 @@ where
     T::Future: Send,
 {
     match &cli.command {
-        Commands::Enroll { .. } | Commands::Status | Commands::Clients { .. } => unreachable!(),
+        Commands::Enroll { .. }
+        | Commands::Status
+        | Commands::Clients { .. }
+        | Commands::GenerateToken { .. } => unreachable!(),
         Commands::Run {
             interactive,
             name,
@@ -371,24 +463,18 @@ where
 
 /// Connect to daemon with mTLS and return the channel (requires prior enrollment).
 async fn connect_authenticated_channel(addr: &str) -> Result<Channel> {
-    // Load trust store to get server fingerprint
     let trust_store = TrustStore::load()?;
     let trusted = trust_store
         .get(addr)
         .with_context(|| format!("Not enrolled with {}. Run 'continuum enroll <token>' first.", addr))?;
 
-    // Load client identity
     let identity_store = IdentityStore::open()?;
     let (_private_key, identity) = identity_store.load_or_generate()?;
 
-    // Parse stored server fingerprint
     let server_fp = Fingerprint::parse(&trusted.fingerprint)
         .context("Invalid server fingerprint in trust store")?;
 
-    // Create verifier that pins to the trusted fingerprint
     let verifier = EnrollmentVerifier::from_fingerprint(&server_fp);
-
-    // Build mTLS config with client identity and pinned server verification
     let tls_config = build_mtls_config(&identity, verifier)?;
 
     build_tls_channel(addr, tls_config)
@@ -429,15 +515,13 @@ fn to_main_api_addr(addr: &str) -> String {
 async fn connect_local_adhoc_channel(addr: &str) -> Result<Channel> {
     use commands::{compute_local_trust_proof, read_local_server_fingerprint};
 
-    // Read server fingerprint from local file
     let server_fingerprint = read_local_server_fingerprint()
         .context("Server fingerprint not found. Is daemon running locally?")?;
 
-    // Verify same-machine proof is available
     let _local_trust_proof = compute_local_trust_proof()
         .context("Not on same machine as daemon")?;
 
-    // Create TLS config pinned to server fingerprint (no client cert)
+    // No client cert needed - same-machine proof used instead
     let verifier = EnrollmentVerifier::from_fingerprint(&server_fingerprint);
     let tls_config = rustls::ClientConfig::builder()
         .dangerous()
@@ -474,8 +558,6 @@ async fn connect_local_adhoc(
     use commands::compute_local_trust_proof;
 
     let channel = connect_local_adhoc_channel(addr).await?;
-
-    // Get the proof for the interceptor
     let proof = compute_local_trust_proof().context("Not on same machine as daemon")?;
 
     let interceptor = LocalProofInterceptor { proof };
@@ -522,6 +604,7 @@ async fn cmd_enroll_local(enrollment_addr: &str, label: Option<&str>) -> Result<
 }
 
 async fn cmd_status(daemon_addr: &str) -> Result<()> {
+    // Connect to main API (50052) where enrollment service is available with mTLS
     let is_authorized = check_status(daemon_addr).await?;
 
     if is_authorized {
@@ -544,6 +627,47 @@ async fn cmd_clients(cli: &Cli, action: &ClientsAction) -> Result<()> {
     }
 }
 
+async fn cmd_generate_token(cli: &Cli, daemon_fp: &str, label: Option<&str>) -> Result<()> {
+    // Build relay config (required for remote token generation)
+    let mut config = relay::RelayConfig::from_env()
+        .context("CONTINUUM_RELAY_ENDPOINT required for remote token generation")?;
+
+    // Apply CLI overrides
+    config = config
+        .with_endpoint(cli.relay_endpoint.clone())
+        .with_no_auth(cli.relay_no_auth);
+
+    eprintln!("Connecting to daemon {} via relay...", daemon_fp);
+
+    // Generate token remotely
+    let (token, expires_at) = commands::generate_token_remote(&config, daemon_fp, label).await?;
+
+    // Format output
+    let expires_at_str = utils::format_timestamp_secs(expires_at);
+
+    if cli.json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "token": token,
+                "expires_at": expires_at,
+                "expires_at_human": expires_at_str,
+            })
+        );
+    } else {
+        println!("Enrollment token generated:");
+        println!();
+        println!("  {}", token);
+        println!();
+        println!("Expires: {}", expires_at_str);
+        println!();
+        println!("Share with user to enroll:");
+        println!("  continuum enroll -t {}", token);
+    }
+
+    Ok(())
+}
+
 // ============================================================================
 // Task Commands
 // ============================================================================
@@ -564,7 +688,6 @@ where
     <T::ResponseBody as tonic::codegen::Body>::Error: Into<tonic::codegen::StdError> + Send,
     T::Future: Send,
 {
-    // Parse environment variables
     let env: std::collections::HashMap<String, String> = envs
         .into_iter()
         .filter_map(|e| {
@@ -942,31 +1065,25 @@ where
 fn wait_for_keypress() {
     let fd = std::io::stdin().as_raw_fd();
 
-    // Check if stdin is a TTY
     if unsafe { libc::isatty(fd) } != 1 {
         return;
     }
 
-    // Get current settings
     let mut original: libc::termios = unsafe { std::mem::zeroed() };
     if unsafe { libc::tcgetattr(fd, &mut original) } != 0 {
         return;
     }
 
-    // Create raw mode settings
     let mut raw = original;
     unsafe { libc::cfmakeraw(&mut raw) };
 
-    // Apply raw mode
     if unsafe { libc::tcsetattr(fd, libc::TCSANOW, &raw) } != 0 {
         return;
     }
 
-    // Read a single byte
     let mut buf = [0u8; 1];
     let _ = std::io::stdin().read_exact(&mut buf);
 
-    // Restore original settings
     unsafe { libc::tcsetattr(fd, libc::TCSANOW, &original) };
 }
 
@@ -1027,13 +1144,21 @@ async fn forward_stdin(
     task_id: String,
     detach_tx: tokio::sync::oneshot::Sender<()>,
 ) -> StdinResult {
-    // Use local ad-hoc for local connections, enrolled for remote
+    // Use same connection logic as main: local ad-hoc first, fall back to enrolled mTLS
     if is_local_address(&daemon_addr) {
         match connect_local_adhoc(&daemon_addr).await {
             Ok(mut client) => {
-                forward_stdin_with_client(&mut client, task_id, detach_tx).await
+                return forward_stdin_with_client(&mut client, task_id, detach_tx).await;
             }
-            Err(e) => StdinResult::Error(e),
+            Err(_) => {
+                // Fall back to enrolled mTLS
+                match connect_authenticated(&daemon_addr).await {
+                    Ok(mut client) => {
+                        return forward_stdin_with_client(&mut client, task_id, detach_tx).await;
+                    }
+                    Err(e) => return StdinResult::Error(e),
+                }
+            }
         }
     } else {
         match connect_authenticated(&daemon_addr).await {

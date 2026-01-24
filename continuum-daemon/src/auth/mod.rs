@@ -7,5 +7,5 @@
 mod store;
 mod trust;
 
-pub use store::{hash_token, AuthStore, AuthStoreError};
+pub use store::{generate_short_code, hash_token, is_short_code, AuthStore, AuthStoreError};
 pub use trust::LocalTrustManager;

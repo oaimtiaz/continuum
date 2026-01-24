@@ -6,11 +6,17 @@
 use arc_swap::ArcSwap;
 use continuum_auth::enrollment::SignedEnrollmentToken;
 use continuum_auth::Fingerprint;
+use rand::rngs::OsRng;
+use rand::RngCore;
 use sha2::{Digest, Sha256};
 use sqlx::{Row, SqlitePool};
 use std::collections::HashSet;
 use std::sync::Arc;
 use tokio::sync::watch;
+
+/// Crockford Base32 charset (excludes 0/O/1/I/L/U for readability)
+const SHORT_CODE_CHARSET: &[u8] = b"23456789ABCDEFGHJKMNPQRSTVWXYZ";
+const SHORT_CODE_LENGTH: usize = 6;
 
 /// Persistent storage for authorized clients and enrollment tokens.
 pub struct AuthStore {
@@ -60,7 +66,8 @@ impl AuthStore {
                 created_at INTEGER NOT NULL,
                 expires_at INTEGER NOT NULL,
                 used_at INTEGER,
-                used_by_fingerprint TEXT
+                used_by_fingerprint TEXT,
+                short_code TEXT UNIQUE
             )
             "#,
         )
@@ -303,6 +310,102 @@ impl AuthStore {
         Ok(was_revoked)
     }
 
+    /// Create enrollment token with short code.
+    ///
+    /// Stores both the token hash and short code for lookup.
+    pub async fn create_enrollment_token_with_short_code(
+        &self,
+        token_hash: &str,
+        short_code: &str,
+        label: Option<&str>,
+        expires_at: i64,
+    ) -> Result<(), AuthStoreError> {
+        let now = current_timestamp();
+        // Store without the dash (normalized)
+        let normalized_code = short_code.replace('-', "");
+
+        sqlx::query(
+            r#"
+            INSERT INTO enrollment_tokens (token_hash, short_code, label, created_at, expires_at)
+            VALUES (?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind(token_hash)
+        .bind(&normalized_code)
+        .bind(label)
+        .bind(now)
+        .bind(expires_at)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
+    /// Atomically create token with short code if under rate limit.
+    pub async fn create_token_with_short_code_rate_limited(
+        &self,
+        token_hash: &str,
+        short_code: &str,
+        label: Option<&str>,
+        expires_at: i64,
+        max_live_tokens: i32,
+    ) -> Result<(), AuthStoreError> {
+        let now = current_timestamp();
+        let normalized_code = short_code.replace('-', "");
+
+        let result = sqlx::query(
+            r#"
+            INSERT INTO enrollment_tokens (token_hash, short_code, label, created_at, expires_at)
+            SELECT ?, ?, ?, ?, ?
+            WHERE (SELECT COUNT(*) FROM enrollment_tokens
+                   WHERE used_at IS NULL AND expires_at > ?) < ?
+            "#,
+        )
+        .bind(token_hash)
+        .bind(&normalized_code)
+        .bind(label)
+        .bind(now)
+        .bind(expires_at)
+        .bind(now)
+        .bind(max_live_tokens)
+        .execute(&self.pool)
+        .await?;
+
+        if result.rows_affected() == 0 {
+            return Err(AuthStoreError::RateLimitExceeded);
+        }
+        Ok(())
+    }
+
+    /// Consume a short code atomically.
+    ///
+    /// Marks the token as used and returns success if it was valid.
+    pub async fn consume_short_code(
+        &self,
+        short_code: &str,
+        used_by_fingerprint: &str,
+    ) -> Result<(), AuthStoreError> {
+        let normalized = short_code.replace('-', "").to_uppercase();
+        let now = current_timestamp();
+
+        let result = sqlx::query(
+            "UPDATE enrollment_tokens
+             SET used_at = ?, used_by_fingerprint = ?
+             WHERE short_code = ? AND used_at IS NULL AND expires_at > ?",
+        )
+        .bind(now)
+        .bind(used_by_fingerprint)
+        .bind(&normalized)
+        .bind(now)
+        .execute(&self.pool)
+        .await?;
+
+        if result.rows_affected() == 0 {
+            return Err(AuthStoreError::TokenAlreadyUsed);
+        }
+
+        Ok(())
+    }
 }
 
 /// Hash a token for storage (never store the raw token).
@@ -313,6 +416,53 @@ pub fn hash_token(token: &str) -> String {
     let normalized: String = token.chars().filter(|&c| c != '-').collect();
     let hash = Sha256::digest(normalized.as_bytes());
     hex::encode(hash)
+}
+
+/// Generate a random 6-character short code in Crockford Base32.
+///
+/// Format: "ABC-123" (displayed with dash for readability).
+pub fn generate_short_code() -> String {
+    let mut random = [0u8; SHORT_CODE_LENGTH];
+    OsRng.fill_bytes(&mut random);
+
+    let code: String = random
+        .iter()
+        .map(|&b| SHORT_CODE_CHARSET[b as usize % SHORT_CODE_CHARSET.len()] as char)
+        .collect();
+
+    // Format as ABC-123
+    format!("{}-{}", &code[..3], &code[3..])
+}
+
+/// Normalize a short code from user input.
+///
+/// - Removes dashes
+/// - Converts to uppercase
+/// - Returns None if invalid format
+pub fn normalize_short_code(input: &str) -> Option<String> {
+    let normalized: String = input
+        .chars()
+        .filter(|c| *c != '-')
+        .map(|c| c.to_ascii_uppercase())
+        .collect();
+
+    if normalized.len() != SHORT_CODE_LENGTH {
+        return None;
+    }
+
+    // Validate all chars are in charset
+    for c in normalized.chars() {
+        if !SHORT_CODE_CHARSET.contains(&(c as u8)) {
+            return None;
+        }
+    }
+
+    Some(normalized)
+}
+
+/// Check if input looks like a short code (6-7 chars with optional dash).
+pub fn is_short_code(input: &str) -> bool {
+    normalize_short_code(input).is_some()
 }
 
 fn current_timestamp() -> i64 {
@@ -327,6 +477,8 @@ fn current_timestamp() -> i64 {
 pub enum AuthStoreError {
     #[error("token already used")]
     TokenAlreadyUsed,
+    #[error("rate limit exceeded: maximum live tokens reached")]
+    RateLimitExceeded,
     #[error("database error: {0}")]
     Database(#[from] sqlx::Error),
 }
@@ -424,5 +576,130 @@ mod tests {
 
         // Should have received a reload signal
         assert!(rx.has_changed().unwrap());
+    }
+
+    #[test]
+    fn test_generate_short_code_format() {
+        let code = generate_short_code();
+        // Format: ABC-123
+        assert_eq!(code.len(), 7); // 6 chars + 1 dash
+        assert_eq!(&code[3..4], "-");
+        // All chars should be in Crockford Base32 charset
+        let normalized = code.replace('-', "");
+        assert_eq!(normalized.len(), 6);
+        for c in normalized.chars() {
+            assert!(SHORT_CODE_CHARSET.contains(&(c as u8)), "Invalid char: {}", c);
+        }
+    }
+
+    #[test]
+    fn test_generate_short_code_uniqueness() {
+        let code1 = generate_short_code();
+        let code2 = generate_short_code();
+        assert_ne!(code1, code2, "Codes should be unique");
+    }
+
+    #[test]
+    fn test_normalize_short_code() {
+        // Valid codes (Crockford Base32: 2-9, A-H, J-N, P-T, V-Z - no 0,1,I,L,O,U)
+        assert!(normalize_short_code("ABC-234").is_some());
+        assert!(normalize_short_code("abc-234").is_some());
+        assert!(normalize_short_code("ABC234").is_some());
+        assert!(normalize_short_code("abc234").is_some());
+        assert!(normalize_short_code("HJK-NRT").is_some()); // All valid chars
+
+        // Invalid codes
+        assert!(normalize_short_code("ABC-23").is_none()); // Too short
+        assert!(normalize_short_code("ABC-2345").is_none()); // Too long
+        assert!(normalize_short_code("ABC-23O").is_none()); // Contains O (not in charset)
+        assert!(normalize_short_code("ABC-23I").is_none()); // Contains I (not in charset)
+        assert!(normalize_short_code("ABC-230").is_none()); // Contains 0 (not in charset)
+        assert!(normalize_short_code("ABC-231").is_none()); // Contains 1 (not in charset)
+    }
+
+    #[test]
+    fn test_is_short_code() {
+        assert!(is_short_code("ABC-234"));
+        assert!(is_short_code("abc-234"));
+        assert!(is_short_code("ABC234"));
+        assert!(!is_short_code("ABC")); // Too short
+        assert!(!is_short_code("ABCDEFGHIJK")); // Too long
+        assert!(!is_short_code("ABC-23O")); // Contains O (not in charset)
+        assert!(!is_short_code("ABC-231")); // Contains 1 (not in charset)
+    }
+
+    #[tokio::test]
+    async fn test_create_and_consume_short_code() {
+        let (store, _rx) = test_store().await;
+        let future_time = current_timestamp() + 300;
+
+        let short_code = "ABC-234"; // Crockford Base32 (no 0,1,I,L,O,U)
+
+        // Create token with short code
+        store
+            .create_enrollment_token_with_short_code(
+                "some_token_hash",
+                short_code,
+                Some("test"),
+                future_time,
+            )
+            .await
+            .expect("Should create token with short code");
+
+        // Consume the short code
+        store
+            .consume_short_code(short_code, "client-fingerprint")
+            .await
+            .expect("Should consume short code");
+
+        // Try to consume again - should fail
+        let result = store.consume_short_code(short_code, "another-client").await;
+        assert!(matches!(result, Err(AuthStoreError::TokenAlreadyUsed)));
+    }
+
+    #[tokio::test]
+    async fn test_short_code_expired() {
+        let (store, _rx) = test_store().await;
+        let past_time = current_timestamp() - 100; // Already expired
+
+        let short_code = "XYZ-789";
+
+        // Create expired token
+        store
+            .create_enrollment_token_with_short_code(
+                "expired_token_hash",
+                short_code,
+                None,
+                past_time,
+            )
+            .await
+            .expect("Should create expired token");
+
+        // Try to consume - should fail (expired)
+        let result = store.consume_short_code(short_code, "client").await;
+        assert!(matches!(result, Err(AuthStoreError::TokenAlreadyUsed)));
+    }
+
+    #[tokio::test]
+    async fn test_short_code_case_insensitive() {
+        let (store, _rx) = test_store().await;
+        let future_time = current_timestamp() + 300;
+
+        // Create with uppercase
+        store
+            .create_enrollment_token_with_short_code(
+                "token_hash",
+                "ABC-DEF",
+                None,
+                future_time,
+            )
+            .await
+            .unwrap();
+
+        // Consume with lowercase
+        store
+            .consume_short_code("abc-def", "client")
+            .await
+            .expect("Should consume with lowercase");
     }
 }

@@ -70,5 +70,14 @@ toml = "0.8"
 sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite"] }
 time = "0.3"
 
+# HTTP client
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+
+# Environment
+dotenvy = "0.15"
+
+# Bytes utilities
+bytes = "1"
+
 # Relay message definitions
 continuum-relay-proto = { git = "https://github.com/oaimtiaz/continuum-relay-proto.git", branch = "main" }

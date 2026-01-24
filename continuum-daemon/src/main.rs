@@ -39,6 +39,10 @@ use uuid::Uuid;
 struct Cli {
     #[command(subcommand)]
     command: Option<Commands>,
+
+    /// Skip relay Auth0 authentication (dev mode - requires relay to also be in dev mode)
+    #[arg(long, hide = true)]
+    relay_no_auth: bool,
 }
 
 #[derive(Subcommand)]
@@ -71,6 +75,7 @@ mod auth;
 mod convert;
 mod db;
 mod ipc;
+mod relay;
 mod services;
 mod store;
 mod supervisor;
@@ -346,11 +351,13 @@ impl Continuum for ContinuumService {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    dotenvy::dotenv().ok();
+
     let cli = Cli::parse();
 
     match cli.command {
         Some(Commands::Token { action }) => cmd_token(action).await,
-        Some(Commands::Serve) | None => cmd_serve().await,
+        Some(Commands::Serve) | None => cmd_serve(cli.relay_no_auth).await,
     }
 }
 
@@ -358,16 +365,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 async fn cmd_token(action: TokenAction) -> Result<(), Box<dyn std::error::Error>> {
     match action {
         TokenAction::Generate { label, validity } => {
-            // Parse validity duration
             let validity_secs = parse_duration(&validity)?;
 
-            // Set up data directory
             let data_dir = dirs::data_local_dir()
                 .unwrap_or_else(|| std::path::PathBuf::from("."))
                 .join("continuum");
             std::fs::create_dir_all(&data_dir)?;
 
-            // Load or generate server key
             let key_path = data_dir.join("server_key.der");
             let server_key = if key_path.exists() {
                 let key_bytes = std::fs::read(&key_path)?;
@@ -383,11 +387,10 @@ async fn cmd_token(action: TokenAction) -> Result<(), Box<dyn std::error::Error>
                 key
             };
 
-            // Generate token
             let token = SignedEnrollmentToken::generate(&server_key, validity_secs as i64);
             let token_base64 = token.to_base64();
 
-            // Store token hash in database (so CompleteEnrollment can validate it)
+            // Token hash stored so CompleteEnrollment can validate it
             let auth_db_path = data_dir.join("auth.db");
             let auth_pool =
                 sqlx::SqlitePool::connect(&format!("sqlite:{}?mode=rwc", auth_db_path.display()))
@@ -399,7 +402,6 @@ async fn cmd_token(action: TokenAction) -> Result<(), Box<dyn std::error::Error>
                 .create_enrollment_token(&token_hash, label.as_deref(), token.expires_at())
                 .await?;
 
-            // Display token
             let expires_at = chrono::DateTime::from_timestamp(token.expires_at(), 0)
                 .map(|dt| dt.format("%Y-%m-%d %H:%M:%S UTC").to_string())
                 .unwrap_or_else(|| "unknown".to_string());
@@ -450,15 +452,13 @@ fn parse_duration(s: &str) -> Result<u32, Box<dyn std::error::Error>> {
 }
 
 /// Start the daemon server.
-async fn cmd_serve() -> Result<(), Box<dyn std::error::Error>> {
-    // Initialize tracing
+async fn cmd_serve(relay_no_auth: bool) -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
         )
         .init();
 
-    // Initialize database
     let data_dir = dirs::data_local_dir()
         .unwrap_or_else(|| std::path::PathBuf::from("."))
         .join("continuum");
@@ -470,13 +470,11 @@ async fn cmd_serve() -> Result<(), Box<dyn std::error::Error>> {
 
     let db = DbService::open(&db_path).await?;
 
-    // Mark any tasks that were running when daemon last stopped as failed
     let orphaned = db.mark_orphaned_tasks_failed().await?;
     if orphaned > 0 {
         tracing::warn!(count = orphaned, "Marked orphaned running tasks as failed");
     }
 
-    // Initialize auth store with TLS reload channel
     let auth_db_path = data_dir.join("auth.db");
     let auth_pool =
         sqlx::SqlitePool::connect(&format!("sqlite:{}?mode=rwc", auth_db_path.display())).await?;
@@ -484,7 +482,6 @@ async fn cmd_serve() -> Result<(), Box<dyn std::error::Error>> {
     let auth_store = Arc::new(auth_store);
     tracing::info!("Auth store initialized with TLS reload channel");
 
-    // Generate or load server identity
     let key_path = data_dir.join("server_key.der");
     let server_key = if key_path.exists() {
         let key_bytes = std::fs::read(&key_path)?;
@@ -501,7 +498,6 @@ async fn cmd_serve() -> Result<(), Box<dyn std::error::Error>> {
     };
     let server_key = Arc::new(server_key);
 
-    // Generate TLS identity (certificate)
     let cert_params = CertParams::default();
     let server_identity = Arc::new(build_self_signed(&server_key, &cert_params)?);
     tracing::info!(
@@ -509,7 +505,6 @@ async fn cmd_serve() -> Result<(), Box<dyn std::error::Error>> {
         "Server identity initialized"
     );
 
-    // Initialize same-machine trust
     let server_fingerprint =
         continuum_auth::identity::Fingerprint::from_public_key(&server_key.public_key());
     let local_trust_manager: Option<Arc<LocalTrustManager>> = match LocalTrustManager::new() {
@@ -530,12 +525,26 @@ async fn cmd_serve() -> Result<(), Box<dyn std::error::Error>> {
     // Extract proof for enrollment service (which only needs the expected proof)
     let local_trust_proof = local_trust_manager.as_ref().map(|m| m.expected_proof());
 
-    // Create store with database and load existing tasks
     let store = Arc::new(TaskStore::new(db));
     store.load_from_db().await?;
 
     let task_count = store.list().await.len();
     tracing::info!(tasks = task_count, "Loaded tasks from database");
+
+    let relay_task_handle = if let Some(relay_config) = relay::RelayConfig::from_env() {
+        let daemon_id = server_fingerprint.to_string();
+        let store_for_relay = store.clone();
+        let handle = tokio::spawn(run_relay_loop(
+            relay_config,
+            daemon_id,
+            relay_no_auth,
+            store_for_relay,
+        ));
+        Some(handle)
+    } else {
+        tracing::info!("Relay not configured (CONTINUUM_RELAY_* env vars not set)");
+        None
+    };
 
     // Dual-port architecture:
     // - Port 50051: Enrollment (server-auth only, no client cert required)
@@ -549,7 +558,6 @@ async fn cmd_serve() -> Result<(), Box<dyn std::error::Error>> {
         supervisor,
     };
 
-    // Create enrollment service with rate limiting
     let rate_limiter = EnrollmentRateLimiter::default();
     let rate_limit_interceptor = RateLimitInterceptor::new(rate_limiter);
     let enrollment_service = EnrollmentServiceImpl::new(
@@ -566,7 +574,6 @@ async fn cmd_serve() -> Result<(), Box<dyn std::error::Error>> {
         .register_encoded_file_descriptor_set(FILE_DESCRIPTOR_SET)
         .build_v1()?;
 
-    // Clone auth_store for the interceptor
     let auth_store_for_interceptor = auth_store.clone();
 
     // Create auth interceptor that checks for:
@@ -608,13 +615,21 @@ async fn cmd_serve() -> Result<(), Box<dyn std::error::Error>> {
     // Enrollment server (port 50051) - only enrollment service, no auth required
     // M3 FIX: Rate limiting applied to prevent DoS and brute-force attacks
     let enrollment_server = Server::builder().add_service(reflection).add_service(
-        EnrollmentServiceServer::with_interceptor(enrollment_service, rate_limit_interceptor),
+        EnrollmentServiceServer::with_interceptor(
+            enrollment_service.clone(),
+            rate_limit_interceptor.clone(),
+        ),
     );
 
     // Main API server (port 50052) - requires mTLS or local proof
+    // Also includes enrollment service for authenticated operations (e.g., status check)
     let main_server = Server::builder()
         .add_service(reflection_main)
-        .add_service(continuum_with_auth);
+        .add_service(continuum_with_auth)
+        .add_service(EnrollmentServiceServer::with_interceptor(
+            enrollment_service,
+            rate_limit_interceptor,
+        ));
 
     tracing::info!(
         enrollment = %enrollment_addr,
@@ -635,6 +650,10 @@ async fn cmd_serve() -> Result<(), Box<dyn std::error::Error>> {
     )
     .await;
 
+    if let Some(handle) = relay_task_handle {
+        handle.abort();
+    }
+
     match shutdown_result {
         Ok(()) => {
             tracing::info!("Daemon shutdown complete");
@@ -645,6 +664,158 @@ async fn cmd_serve() -> Result<(), Box<dyn std::error::Error>> {
             Err(e)
         }
     }
+}
+
+/// Run the relay connection loop.
+///
+/// This function maintains a connection to the relay server and handles
+/// incoming tunnel requests by bridging them to local services.
+/// It also provides the relay handle to the store for attention forwarding.
+async fn run_relay_loop(
+    config: relay::RelayConfig,
+    daemon_id: String,
+    no_auth: bool,
+    store: Arc<TaskStore>,
+) {
+    loop {
+        tracing::info!(daemon_id = %daemon_id, endpoint = %config.endpoint, "Connecting to relay...");
+
+        match relay::RelayClient::new(config.clone(), daemon_id.clone(), no_auth).connect().await {
+            Ok(mut connection) => {
+                tracing::info!(daemon_id = %daemon_id, "Registered with relay");
+
+                // Make relay handle available to IPC handlers for attention forwarding
+                store.set_relay_handle(connection.handle()).await;
+
+                loop {
+                    match connection.next_event().await {
+                        Ok(relay::RelayEvent::SessionRequest(request)) => {
+                            tracing::info!(
+                                session_id = %request.session_id,
+                                target = ?request.target,
+                                "Incoming relay session"
+                            );
+
+                            // Accept session synchronously (quick), spawn bridging in background
+                            match accept_and_bridge_session(&mut connection, request).await {
+                                Ok(Some((session_id, bridging_task))) => {
+                                    // Spawn the bridging work in background so we can
+                                    // continue processing next_event() (including pings)
+                                    tokio::spawn(async move {
+                                        if let Err(e) = bridging_task.await {
+                                            tracing::warn!(
+                                                session_id = %session_id,
+                                                error = %e,
+                                                "Session bridging failed"
+                                            );
+                                        }
+                                    });
+                                }
+                                Ok(None) => {
+                                    // Session was rejected (e.g., local service unavailable)
+                                }
+                                Err(e) => {
+                                    tracing::warn!(error = %e, "Failed to accept relay session");
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!(error = %e, "Relay connection error");
+                            break; // Reconnect
+                        }
+                    }
+                }
+
+                // Connection lost, clear relay handle
+                store.clear_relay_handle().await;
+            }
+            Err(relay::RelayError::Rpc(status)) if status.code() == tonic::Code::PermissionDenied => {
+                tracing::error!(
+                    "Fingerprint rejected by relay. Certificate may have changed. \
+                     Check daemon logs for fingerprint and verify with relay admin."
+                );
+                return; // Don't retry - this is a configuration error
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "Failed to connect to relay");
+            }
+        }
+
+        // Backoff before reconnect
+        tracing::info!("Reconnecting to relay in 5 seconds...");
+        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+    }
+}
+
+/// Accept a relay session and prepare the bridging work.
+///
+/// Returns `Ok(Some((session_id, future)))` if the session was accepted successfully.
+/// The returned future performs the bidirectional copy and should be spawned.
+/// Returns `Ok(None)` if the session was rejected (e.g., local service unavailable).
+async fn accept_and_bridge_session(
+    connection: &mut relay::RelayConnection,
+    request: relay::SessionRequest,
+) -> Result<Option<(String, impl std::future::Future<Output = Result<(), std::io::Error>>)>, relay::RelayError>
+{
+    let local_addr = match request.target {
+        relay::TunnelTarget::Enrollment => "127.0.0.1:50051",
+        relay::TunnelTarget::Main => "127.0.0.1:50052",
+    };
+
+    let local_stream = match tokio::net::TcpStream::connect(local_addr).await {
+        Ok(stream) => stream,
+        Err(e) => {
+            tracing::warn!(
+                session_id = %request.session_id,
+                local_addr = %local_addr,
+                error = %e,
+                "Failed to connect to local service"
+            );
+            connection.reject_session(&request.session_id, "local service unavailable").await?;
+            return Ok(None);
+        }
+    };
+
+    // Empty client_token - daemon doesn't validate this
+    let tunnel = connection.accept_session(&request, "").await?;
+    let session_id = request.session_id.clone();
+
+    let bridging_future = async move {
+        let (mut tunnel_read, mut tunnel_write) = tokio::io::split(tunnel);
+        let (mut local_read, mut local_write) = local_stream.into_split();
+
+        let session_id_c2l = session_id.clone();
+        let session_id_l2c = session_id.clone();
+
+        let client_to_local = async move {
+            let result = tokio::io::copy(&mut tunnel_read, &mut local_write).await;
+            tracing::debug!(session_id = %session_id_c2l, bytes = ?result, "client->local copy done");
+            result
+        };
+
+        let local_to_client = async move {
+            let result = tokio::io::copy(&mut local_read, &mut tunnel_write).await;
+            tracing::debug!(session_id = %session_id_l2c, bytes = ?result, "local->client copy done");
+            result
+        };
+
+        tokio::select! {
+            r = client_to_local => {
+                if let Err(e) = &r {
+                    tracing::debug!(session_id = %session_id, error = %e, "client->local error");
+                }
+                r.map(|_| ())
+            }
+            r = local_to_client => {
+                if let Err(e) = &r {
+                    tracing::debug!(session_id = %session_id, error = %e, "local->client error");
+                }
+                r.map(|_| ())
+            }
+        }
+    };
+
+    Ok(Some((request.session_id, bridging_future)))
 }
 
 // Wrapper type for TLS streams that implements tonic's Connected trait
@@ -661,7 +832,6 @@ mod tls_io {
     use tokio_rustls::server::TlsStream;
     use tonic::transport::server::Connected;
 
-    // Re-export TlsConnectInfo from the shared tls module
     pub use crate::tls::TlsConnectInfo;
 
     /// Wrapper around TlsStream that implements tonic's Connected trait.
@@ -766,19 +936,17 @@ async fn run_dual_port_servers(
     let initial_acceptor = TlsAcceptor::from(main_tls_config.into_rustls_config());
     let reloadable_acceptor = tls::ReloadableTlsAcceptor::new(initial_acceptor, server_identity);
 
-    // Bind TCP listeners for both ports
     let enrollment_listener = TcpListener::bind(enrollment_addr).await?;
     let main_listener = TcpListener::bind(main_addr).await?;
     tracing::info!("Enrollment listener bound to {}", enrollment_addr);
     tracing::info!("Main API listener bound to {} (mTLS)", main_addr);
 
-    // Create shutdown signal with broadcast channel (multiple receivers)
+    // Broadcast channel for shutdown (multiple receivers)
     let store_for_signal = store.clone();
     let (shutdown_tx, _) = tokio::sync::broadcast::channel::<()>(1);
     let mut shutdown_rx_enrollment = shutdown_tx.subscribe();
     let mut shutdown_rx_main = shutdown_tx.subscribe();
 
-    // Spawn signal handler task
     let shutdown_tx_clone = shutdown_tx.clone();
     let signal_task = tokio::spawn(async move {
         let ctrl_c = async {
@@ -813,7 +981,7 @@ async fn run_dual_port_servers(
         let _ = shutdown_tx_clone.send(());
     });
 
-    // Create incoming TLS stream for enrollment port (server-auth only)
+    // Enrollment port: server-auth only
     let enrollment_acceptor_clone = enrollment_acceptor.clone();
     let enrollment_incoming = async_stream::stream! {
         loop {
@@ -849,7 +1017,7 @@ async fn run_dual_port_servers(
         }
     };
 
-    // Create incoming TLS stream for main port (mTLS) with dynamic reload support
+    // Main port: mTLS with dynamic reload support
     let acceptor_for_loop = reloadable_acceptor.clone();
     let auth_store_for_reload = auth_store.clone();
     let main_incoming = async_stream::stream! {
@@ -913,7 +1081,6 @@ async fn run_dual_port_servers(
         }
     };
 
-    // Spawn both servers concurrently
     let enrollment_handle = tokio::spawn(async move {
         enrollment_server
             .serve_with_incoming(enrollment_incoming)
@@ -923,7 +1090,6 @@ async fn run_dual_port_servers(
     let main_handle =
         tokio::spawn(async move { main_server.serve_with_incoming(main_incoming).await });
 
-    // Wait for either server to finish (or both on shutdown)
     tokio::select! {
         result = enrollment_handle => {
             if let Err(e) = result {
@@ -937,7 +1103,6 @@ async fn run_dual_port_servers(
         }
     }
 
-    // Wait for signal task to complete
     let _ = signal_task.await;
 
     tracing::info!("Dual-port servers stopped, shutdown complete");

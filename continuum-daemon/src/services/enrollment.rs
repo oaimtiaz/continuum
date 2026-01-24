@@ -1,6 +1,6 @@
 //! Enrollment gRPC service implementation.
 
-use crate::auth::{hash_token, AuthStore, AuthStoreError};
+use crate::auth::{generate_short_code, hash_token, is_short_code, AuthStore, AuthStoreError};
 use crate::tls::{TlsConnectInfo, TlsIdentity};
 
 /// Get current Unix timestamp in seconds.
@@ -20,6 +20,7 @@ use subtle::ConstantTimeEq;
 use tonic::{Request, Response, Status};
 
 /// Implementation of the EnrollmentService gRPC service.
+#[derive(Clone)]
 pub struct EnrollmentServiceImpl {
     auth_store: Arc<AuthStore>,
     server_key: Arc<PrivateKey>,
@@ -86,16 +87,16 @@ impl enrollment_service_server::EnrollmentService for EnrollmentServiceImpl {
             req.validity_seconds.clamp(60, 3600)
         };
 
-        // Generate signed token
         let token = SignedEnrollmentToken::generate(&self.server_key, validity as i64);
+        let short_code = generate_short_code();
 
-        // Store token hash for later validation
         let token_base64 = token.to_base64();
         let token_hash = hash_token(&token_base64);
 
         self.auth_store
-            .create_enrollment_token(
+            .create_enrollment_token_with_short_code(
                 &token_hash,
+                &short_code,
                 if req.label.is_empty() {
                     None
                 } else {
@@ -108,6 +109,7 @@ impl enrollment_service_server::EnrollmentService for EnrollmentServiceImpl {
 
         tracing::info!(
             label = %req.label,
+            short_code = %short_code,
             expires_at = token.expires_at(),
             "Enrollment token generated"
         );
@@ -116,6 +118,7 @@ impl enrollment_service_server::EnrollmentService for EnrollmentServiceImpl {
             token: token_base64,
             display_string: format!("{}", token),
             expires_at: token.expires_at(),
+            short_code,
         }))
     }
 
@@ -125,7 +128,6 @@ impl enrollment_service_server::EnrollmentService for EnrollmentServiceImpl {
     ) -> Result<Response<CompleteEnrollmentResponse>, Status> {
         let req = request.into_inner();
 
-        // Parse client public key
         let public_key = PublicKey::from_bytes(&req.public_key)
             .map_err(|_| Status::invalid_argument("invalid public key: must be 32 bytes"))?;
         let fingerprint = Fingerprint::from_public_key(&public_key);
@@ -155,10 +157,35 @@ impl enrollment_service_server::EnrollmentService for EnrollmentServiceImpl {
         let is_local_enrollment = req.token.is_empty() && is_same_machine;
 
         if is_local_enrollment {
-            // Local enrollment authorized via same-machine proof
             tracing::info!(fingerprint = %fingerprint_str, "Local enrollment authorized");
+        } else if is_short_code(&req.token) {
+            // Short code enrollment (TOFU - client trusts first server)
+            tracing::info!(fingerprint = %fingerprint_str, "Short code enrollment attempt");
+
+            match self
+                .auth_store
+                .consume_short_code(&req.token, &fingerprint_str)
+                .await
+            {
+                Ok(()) => {
+                    tracing::info!(fingerprint = %fingerprint_str, "Short code validated");
+                }
+                Err(AuthStoreError::TokenAlreadyUsed) => {
+                    tracing::warn!(fingerprint = %fingerprint_str, "Short code already used or expired");
+                    return Ok(Response::new(CompleteEnrollmentResponse {
+                        status: EnrollmentStatus::Rejected.into(),
+                        server_cert_der: vec![],
+                        client_fingerprint: fingerprint_str,
+                        rejection_reason: "Invalid or expired code".to_string(),
+                    }));
+                }
+                Err(e) => {
+                    tracing::error!(error = %e, "Short code database error");
+                    return Err(Status::internal("internal error"));
+                }
+            }
         } else {
-            // Token-based enrollment - first verify cryptographic signature (C1 fix)
+            // Full token enrollment - verify cryptographic signature
             let token = match SignedEnrollmentToken::from_base64(&req.token) {
                 Ok(t) => t,
                 Err(_) => {
@@ -173,7 +200,6 @@ impl enrollment_service_server::EnrollmentService for EnrollmentServiceImpl {
                 }
             };
 
-            // Verify signature proves token was issued by this server
             let now = current_timestamp();
             if token.validate(&self.server_key.public_key(), now).is_err() {
                 tracing::warn!(fingerprint = %fingerprint_str, "Token signature verification failed");
@@ -186,8 +212,6 @@ impl enrollment_service_server::EnrollmentService for EnrollmentServiceImpl {
                 }));
             }
 
-            // C4 FIX: Use consume_validated_token with the already-validated token struct
-            // This eliminates TOCTOU race by passing the validated token directly
             match self
                 .auth_store
                 .consume_validated_token(&token, &fingerprint_str)
@@ -212,7 +236,6 @@ impl enrollment_service_server::EnrollmentService for EnrollmentServiceImpl {
             }
         }
 
-        // Authorize client (auto-label "local" for local enrollments)
         let label = if is_local_enrollment {
             Some("local")
         } else {
@@ -315,6 +338,61 @@ impl enrollment_service_server::EnrollmentService for EnrollmentServiceImpl {
         }
 
         Ok(Response::new(RevokeClientResponse { success }))
+    }
+
+    async fn request_enrollment_token(
+        &self,
+        request: Request<RequestEnrollmentTokenRequest>,
+    ) -> Result<Response<RequestEnrollmentTokenResponse>, Status> {
+        // Require mTLS authentication (client must be enrolled)
+        self.require_authenticated(&request)?;
+
+        let req = request.into_inner();
+
+        // Generate signed token and short code
+        const DEFAULT_VALIDITY_SECONDS: i64 = 300;
+        const MAX_LIVE_TOKENS: i32 = 3;
+
+        let token = SignedEnrollmentToken::generate(&self.server_key, DEFAULT_VALIDITY_SECONDS);
+        let short_code = generate_short_code();
+
+        // Store token hash with short code
+        let token_base64 = token.to_base64();
+        let token_hash = hash_token(&token_base64);
+
+        // Atomic insert with rate limit check
+        self.auth_store
+            .create_token_with_short_code_rate_limited(
+                &token_hash,
+                &short_code,
+                if req.label.is_empty() {
+                    None
+                } else {
+                    Some(&req.label)
+                },
+                token.expires_at(),
+                MAX_LIVE_TOKENS,
+            )
+            .await
+            .map_err(|e| match e {
+                AuthStoreError::RateLimitExceeded => Status::resource_exhausted(
+                    "Rate limit reached: 3 live tokens maximum. Wait for tokens to expire or be used.",
+                ),
+                _ => Status::internal(format!("Failed to store token: {}", e)),
+            })?;
+
+        tracing::info!(
+            label = %req.label,
+            short_code = %short_code,
+            expires_at = token.expires_at(),
+            "Enrollment token created remotely"
+        );
+
+        Ok(Response::new(RequestEnrollmentTokenResponse {
+            token: token_base64,
+            expires_at: token.expires_at(),
+            short_code,
+        }))
     }
 }
 

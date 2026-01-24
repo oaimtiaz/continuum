@@ -201,6 +201,97 @@ where
     Ok(config)
 }
 
+/// TOFU (Trust-On-First-Use) verifier for short code enrollment.
+///
+/// Accepts any valid certificate and captures the server's fingerprint
+/// for storage after enrollment completes.
+///
+/// # Security
+///
+/// This verifier accepts any certificate - it's only secure when:
+/// 1. The short code was securely communicated out-of-band
+/// 2. An attacker cannot intercept both the short code AND the connection
+/// 3. After enrollment, the fingerprint is stored for future verification
+#[derive(Debug)]
+pub struct TofuVerifier {
+    /// Captured fingerprint (populated after verification)
+    captured_fingerprint: std::sync::Mutex<Option<Fingerprint>>,
+}
+
+impl TofuVerifier {
+    /// Create a new TOFU verifier.
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self {
+            captured_fingerprint: std::sync::Mutex::new(None),
+        })
+    }
+
+    /// Get the captured server fingerprint after connection.
+    pub fn captured_fingerprint(&self) -> Option<Fingerprint> {
+        self.captured_fingerprint.lock().unwrap().clone()
+    }
+}
+
+impl rustls::client::danger::ServerCertVerifier for TofuVerifier {
+    fn verify_server_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _server_name: &ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        // Extract public key from certificate
+        let public_key_bytes = extract_public_key_from_cert(end_entity.as_ref()).map_err(|_| {
+            rustls::Error::InvalidCertificate(rustls::CertificateError::BadEncoding)
+        })?;
+
+        // Compute fingerprint
+        let hash: [u8; 32] = Sha256::digest(&public_key_bytes).into();
+        let fingerprint = Fingerprint::from_hash_bytes(hash);
+
+        // Store captured fingerprint
+        *self.captured_fingerprint.lock().unwrap() = Some(fingerprint);
+
+        // Accept the certificate (TOFU)
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(
+            message,
+            cert,
+            dss,
+            &rustls::crypto::ring::default_provider().signature_verification_algorithms,
+        )
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(
+            message,
+            cert,
+            dss,
+            &rustls::crypto::ring::default_provider().signature_verification_algorithms,
+        )
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        rustls::crypto::ring::default_provider()
+            .signature_verification_algorithms
+            .supported_schemes()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

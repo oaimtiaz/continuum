@@ -5,3 +5,6 @@ Cargo.lock
 .obsidian
 
 *.code-workspace
+
+# Local cargo config (for dependency overrides)
+.cargo/

@@ -4,10 +4,11 @@
 //! - Private keys are zeroized on drop
 //! - No Debug/Display implementations that leak secrets
 //! - Fingerprints use constant-time comparison
-//! - SSH-compatible fingerprint format: `SHA256:{base64_no_padding}`
+//! - URL-safe fingerprint format: `SHA256:{url_safe_base64_no_padding}`
 //! - PKCS#8 DER exports are automatically zeroized
 
-use base64::prelude::*;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use base64::Engine;
 use ed25519_dalek::Signer;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -288,11 +289,11 @@ impl Fingerprint {
         let mut hasher = Sha256::new();
         hasher.update(public_key.to_bytes());
         let hash = hasher.finalize();
-        // Use standard base64 without padding (SSH format)
+        // Use URL-safe base64 without padding (relay-compatible format)
         Self(format!(
             "{}{}",
             Self::PREFIX,
-            BASE64_STANDARD_NO_PAD.encode(hash)
+            URL_SAFE_NO_PAD.encode(hash)
         ))
     }
 
@@ -309,7 +310,7 @@ impl Fingerprint {
 
         let encoded = &s[Self::PREFIX.len()..];
         // Validate it's valid base64 of correct length (32 bytes = 43 chars in base64 no-pad)
-        let decoded = BASE64_STANDARD_NO_PAD
+        let decoded = URL_SAFE_NO_PAD
             .decode(encoded)
             .map_err(|_| KeyError::InvalidFingerprint)?;
 
@@ -334,7 +335,7 @@ impl Fingerprint {
             .0
             .strip_prefix(Self::PREFIX)
             .expect("Fingerprint invariant violated: missing prefix");
-        let decoded = BASE64_STANDARD_NO_PAD
+        let decoded = URL_SAFE_NO_PAD
             .decode(encoded)
             .expect("Fingerprint invariant violated: invalid base64");
         decoded
@@ -350,7 +351,7 @@ impl Fingerprint {
     /// Used when deserializing fingerprints embedded in enrollment tokens.
     #[must_use]
     pub fn from_hash_bytes(hash: [u8; 32]) -> Self {
-        Self(format!("{}{}", Self::PREFIX, BASE64_STANDARD_NO_PAD.encode(hash)))
+        Self(format!("{}{}", Self::PREFIX, URL_SAFE_NO_PAD.encode(hash)))
     }
 
     /// Get the fingerprint as a string reference.

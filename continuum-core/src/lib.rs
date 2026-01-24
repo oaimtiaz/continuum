@@ -32,6 +32,9 @@ pub mod audit;
 pub mod identity;
 pub mod task;
 
+#[cfg(feature = "relay")]
+pub mod relay;
+
 // Re-export commonly used types at crate root for convenience.
 // Users can write `use continuum_core::Task` instead of `use continuum_core::task::Task`.
 

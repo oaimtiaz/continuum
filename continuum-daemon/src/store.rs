@@ -8,6 +8,7 @@ use continuum_shim_proto::DaemonToShim;
 use tokio::sync::{broadcast, mpsc, RwLock};
 
 use crate::db::DbService;
+use crate::relay::RelayHandle;
 
 /// A chunk of output from a task.
 #[derive(Debug, Clone)]
@@ -65,6 +66,9 @@ pub struct TaskStore {
     db: DbService,
     /// Flag indicating the daemon is shutting down.
     shutting_down: AtomicBool,
+    /// Handle to relay for sending attention requests.
+    /// Set when relay connects, cleared on disconnect.
+    relay_handle: RwLock<Option<RelayHandle>>,
 }
 
 impl TaskStore {
@@ -74,12 +78,32 @@ impl TaskStore {
             inner: RwLock::new(HashMap::new()),
             db,
             shutting_down: AtomicBool::new(false),
+            relay_handle: RwLock::new(None),
         }
     }
 
     /// Check if the daemon is shutting down.
     pub fn is_shutting_down(&self) -> bool {
         self.shutting_down.load(Ordering::Relaxed)
+    }
+
+    /// Set the relay handle for sending attention requests.
+    ///
+    /// Called when relay connection is established.
+    pub async fn set_relay_handle(&self, handle: RelayHandle) {
+        *self.relay_handle.write().await = Some(handle);
+    }
+
+    /// Clear the relay handle.
+    ///
+    /// Called when relay connection is lost.
+    pub async fn clear_relay_handle(&self) {
+        *self.relay_handle.write().await = None;
+    }
+
+    /// Get a clone of the relay handle if connected.
+    pub async fn relay_handle(&self) -> Option<RelayHandle> {
+        self.relay_handle.read().await.clone()
     }
 
     /// Load existing tasks from the database.

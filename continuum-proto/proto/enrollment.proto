@@ -26,6 +26,12 @@ service EnrollmentService {
 
     // Revoke a client's authorization
     rpc RevokeClient(RevokeClientRequest) returns (RevokeClientResponse);
+
+    // Request a new enrollment token remotely (requires mTLS auth, rate limited)
+    // Only enrolled clients can generate tokens for others to enroll.
+    // Rate limited to 3 concurrent live tokens per daemon.
+    rpc RequestEnrollmentToken(RequestEnrollmentTokenRequest)
+        returns (RequestEnrollmentTokenResponse);
 }
 
 message InitiateEnrollmentRequest {
@@ -42,6 +48,8 @@ message InitiateEnrollmentResponse {
     string display_string = 2;
     // Expiration timestamp (Unix seconds)
     int64 expires_at = 3;
+    // Short code for easy sharing (e.g., "ABC-123")
+    string short_code = 4;
 }
 
 message CompleteEnrollmentRequest {
@@ -112,4 +120,20 @@ message RevokeClientRequest {
 message RevokeClientResponse {
     // Whether revocation succeeded
     bool success = 1;
+}
+
+// === Remote Token Generation ===
+
+message RequestEnrollmentTokenRequest {
+    // Optional human-readable label for the token
+    string label = 1;
+}
+
+message RequestEnrollmentTokenResponse {
+    // The enrollment token (base64-encoded, signed)
+    string token = 1;
+    // Expiration timestamp (Unix seconds)
+    int64 expires_at = 2;
+    // Short code for easy sharing (e.g., "ABC-123")
+    string short_code = 3;
 }

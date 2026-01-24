@@ -8,7 +8,7 @@ use rustls::ClientConfig;
 use sha2::{Digest, Sha256};
 use tonic::transport::Channel;
 
-pub use client::{build_mtls_config, ClientIdentity, EnrollmentVerifier};
+pub use client::{build_mtls_config, ClientIdentity, EnrollmentVerifier, TofuVerifier};
 pub use continuum_auth::cert::extract_public_key_from_cert;
 
 /// Extract fingerprint from a DER-encoded certificate.

@@ -261,6 +261,7 @@ impl EnrollmentService for TestEnrollmentService {
             token: token_base64,
             display_string: format!("{}", token),
             expires_at: token.expires_at(),
+            short_code: String::new(), // Test harness doesn't use short codes
         }))
     }
 
@@ -431,6 +432,16 @@ impl EnrollmentService for TestEnrollmentService {
         Ok(tonic::Response::new(RevokeClientResponse {
             success: result.rows_affected() > 0,
         }))
+    }
+
+    async fn request_enrollment_token(
+        &self,
+        _request: tonic::Request<RequestEnrollmentTokenRequest>,
+    ) -> Result<tonic::Response<RequestEnrollmentTokenResponse>, tonic::Status> {
+        // Test harness: not implemented (would require mTLS context)
+        Err(tonic::Status::unimplemented(
+            "request_enrollment_token not implemented in test harness",
+        ))
     }
 }
 
