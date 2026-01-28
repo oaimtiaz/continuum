@@ -1,0 +1,10 @@
+# UniFFI configuration for continuum-mobile
+# See: https://mozilla.github.io/uniffi-rs/latest/
+
+[bindings.swift]
+# Generate Swift bindings for iOS
+module_name = "ContinuumMobile"
+
+[bindings.kotlin]
+# Generate Kotlin bindings for Android
+package_name = "com.continuum.mobile"

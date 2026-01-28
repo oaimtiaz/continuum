@@ -1,0 +1,61 @@
+[package]
+name = "continuum-mobile"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Mobile client core for Continuum - UniFFI bindings for iOS/Android"
+
+[lib]
+crate-type = ["cdylib", "staticlib", "lib"]
+
+[dependencies]
+# Workspace dependencies (shared with other crates)
+continuum-auth = { path = "../continuum-auth" }
+continuum-core = { path = "../continuum-core", features = ["relay"] }
+continuum-relay-proto = { workspace = true }
+
+# Encoding
+base64 = { workspace = true }
+
+# UniFFI for cross-platform bindings
+uniffi = "0.28"
+
+# TLS without OpenSSL dependency
+rustls = { workspace = true }
+rustls-platform-verifier = "0.5"
+tokio-rustls = "0.26"
+
+# Certificate generation
+rcgen = { workspace = true }
+
+# Crypto utilities
+sha2 = { workspace = true }
+subtle = { workspace = true }
+zeroize = { workspace = true }
+
+# Async runtime - single-threaded for mobile efficiency
+tokio = { version = "1", features = ["rt", "sync", "time"] }
+tokio-stream = "0.1"
+
+# Bytes for efficient buffer handling
+bytes = "1"
+
+# HTTP client
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+
+# gRPC for relay communication
+tonic = { workspace = true }
+
+# Serialization
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# Error handling
+thiserror = { workspace = true }
+
+[build-dependencies]
+uniffi = { version = "0.28", features = ["build"] }
+
+[dev-dependencies]
+wiremock = "0.6"
+tokio = { version = "1", features = ["rt", "macros"] }
