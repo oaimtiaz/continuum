@@ -8,3 +8,7 @@ Cargo.lock
 
 # Local cargo config (for dependency overrides)
 .cargo/
+
+.DS_Store
+
+/**/.DS_Store

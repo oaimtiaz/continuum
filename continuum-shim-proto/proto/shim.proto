@@ -51,7 +51,13 @@ message DaemonToShim {
     Signal signal = 2;
     Resize resize = 3;
     Shutdown shutdown = 4;
+    AttentionResponse attention_response = 5;
   }
+}
+
+message AttentionResponse {
+  string attention_id = 1;
+  bytes  payload      = 2;
 }
 
 message Stdin {

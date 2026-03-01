@@ -117,6 +117,34 @@ pub fn spawn_pty(spec: SpawnSpec) -> Result<PtyChild, PtyError> {
             unsafe { libc::_exit(1) };
         }
 
+        // Clear blocked signal mask inherited from parent (tokio blocks signals
+        // in worker threads; the child inherits this via fork).
+        let mut empty_set: libc::sigset_t = unsafe { std::mem::zeroed() };
+        unsafe {
+            libc::sigemptyset(&mut empty_set);
+            libc::sigprocmask(libc::SIG_SETMASK, &empty_set, std::ptr::null_mut());
+        }
+
+        // Reset signal dispositions to SIG_DFL.
+        // SIGPIPE: Rust sets to SIG_IGN, breaks pipelines.
+        // SIGWINCH: needed for TUI resize.
+        // SIGTSTP: needed for Ctrl+Z.
+        for &sig in &[
+            libc::SIGCHLD,
+            libc::SIGHUP,
+            libc::SIGINT,
+            libc::SIGQUIT,
+            libc::SIGTERM,
+            libc::SIGALRM,
+            libc::SIGPIPE,
+            libc::SIGWINCH,
+            libc::SIGTSTP,
+        ] {
+            unsafe {
+                libc::signal(sig, libc::SIG_DFL);
+            }
+        }
+
         // Duplicate slave fd to stdin/stdout/stderr
         let slave_fd = slave.as_raw_fd();
         if unsafe { libc::dup2(slave_fd, libc::STDIN_FILENO) } < 0 {

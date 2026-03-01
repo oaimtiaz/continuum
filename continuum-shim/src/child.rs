@@ -31,7 +31,12 @@ impl Child {
             .collect();
 
         // Build environment
-        let env: BTreeMap<String, String> = args.parse_env().into_iter().collect();
+        let mut env: BTreeMap<String, String> = args.parse_env().into_iter().collect();
+
+        // Inject TERM if not provided — TUI apps need terminfo (nvim, htop, etc.)
+        if !env.contains_key("TERM") {
+            env.insert("TERM".into(), "xterm-256color".into());
+        }
 
         // Canonicalize cwd
         let cwd = args.cwd.canonicalize().unwrap_or_else(|_| args.cwd.clone());
@@ -69,7 +74,6 @@ impl Child {
     }
 
     /// Resize the PTY and optionally notify the process group.
-    #[allow(dead_code)]
     pub fn resize(&self, rows: u16, cols: u16, notify: bool) -> Result<(), PtyError> {
         let notify_pgid = if notify { Some(self.inner.pgid) } else { None };
         resize(&self.inner.master, Winsz::new(rows, cols), notify_pgid)

@@ -1,20 +1,24 @@
 //! Main orchestration loop.
 
 use std::sync::Arc;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use continuum_pty::{ExitStatus, Signal};
 use continuum_shim_proto::daemon_to_shim;
 use tokio::sync::mpsc;
-use tokio::time::interval;
 
 use crate::args::Args;
-use crate::attention::{AttentionConfig, AttentionDetector};
 use crate::child::Child;
 use crate::io::pty_reader::{run_pty_reader, PtyOutput};
 use crate::io::pty_writer::run_pty_writer;
 use crate::ipc::{unix, IpcClient};
+
+#[cfg(feature = "attention")]
+use std::time::Instant;
+
+#[cfg(feature = "attention")]
+use crate::attention::{AttentionConfig, AttentionDetector};
 
 /// Get current timestamp in milliseconds since epoch.
 fn timestamp_ms() -> i64 {
@@ -46,9 +50,13 @@ pub async fn run(args: Args) -> Result<i32> {
 
     // Create channels
     let (output_tx, mut output_rx) = mpsc::channel::<PtyOutput>(256);
-    let (attention_tx, mut attention_rx) = mpsc::channel::<(Vec<u8>, Instant)>(256);
+    // attention_rx is only consumed when the attention feature is enabled;
+    // the PTY reader still sends on attention_tx unconditionally (try_send, fire-and-forget).
+    #[allow(unused_variables, unused_mut)]
+    let (attention_tx, mut attention_rx) = mpsc::channel::<(Vec<u8>, std::time::Instant)>(256);
     let (stdin_tx, stdin_rx) = mpsc::channel::<Vec<u8>>(64);
-    let (input_notify_tx, mut input_notify_rx) = mpsc::channel::<Instant>(64);
+    #[allow(unused_variables, unused_mut)]
+    let (input_notify_tx, mut input_notify_rx) = mpsc::channel::<std::time::Instant>(64);
 
     // Spawn PTY reader task
     let reader_handle =
@@ -57,10 +65,6 @@ pub async fn run(args: Args) -> Result<i32> {
     // Spawn PTY writer task
     let writer_handle =
         tokio::spawn(async move { run_pty_writer(master_fd, stdin_rx, input_notify_tx).await });
-
-    // Attention detector
-    let mut detector = AttentionDetector::new(AttentionConfig::default());
-    let mut attention_ticker = interval(Duration::from_millis(100));
 
     // IPC message sending task
     let client_send = client.clone();
@@ -103,15 +107,36 @@ pub async fn run(args: Args) -> Result<i32> {
                                 }
                             }
                             daemon_to_shim::Msg::Resize(resize) => {
-                                tracing::debug!(
-                                    "resize requested: {}x{}",
-                                    resize.rows,
-                                    resize.cols
-                                );
+                                let rows = resize.rows as u16;
+                                let cols = resize.cols as u16;
+                                if rows > 0 && cols > 0 {
+                                    let ws = libc::winsize {
+                                        ws_row: rows,
+                                        ws_col: cols,
+                                        ws_xpixel: 0,
+                                        ws_ypixel: 0,
+                                    };
+                                    let ret = unsafe {
+                                        libc::ioctl(master_fd, libc::TIOCSWINSZ, &ws)
+                                    };
+                                    if ret != 0 {
+                                        tracing::warn!("resize ioctl failed: {}", std::io::Error::last_os_error());
+                                    }
+                                    unsafe { libc::kill(-pgid, libc::SIGWINCH); }
+                                }
                             }
                             daemon_to_shim::Msg::Shutdown(_) => {
                                 tracing::info!("shutdown requested by daemon");
                                 break;
+                            }
+                            daemon_to_shim::Msg::AttentionResponse(resp) => {
+                                tracing::debug!(
+                                    attention_id = %resp.attention_id,
+                                    "forwarding attention response to stdin"
+                                );
+                                if let Err(e) = stdin_tx_clone.send(resp.payload).await {
+                                    tracing::warn!("failed to forward attention response to stdin: {e}");
+                                }
                             }
                         }
                     }
@@ -128,40 +153,50 @@ pub async fn run(args: Args) -> Result<i32> {
         }
     });
 
-    // Main loop: wait for child exit while processing attention
-    let exit_status = loop {
-        tokio::select! {
-            // Check attention detector
-            _ = attention_ticker.tick() => {
-                // Process any pending attention data
-                while let Ok((data, ts)) = attention_rx.try_recv() {
-                    detector.on_output(&data, ts);
+    // Main loop: wait for child exit
+    #[cfg(feature = "attention")]
+    let exit_status = {
+        let mut detector = AttentionDetector::new(AttentionConfig::default());
+        let mut attention_ticker = tokio::time::interval(Duration::from_millis(100));
+        loop {
+            tokio::select! {
+                _ = attention_ticker.tick() => {
+                    while let Ok((data, ts)) = attention_rx.try_recv() {
+                        detector.on_output(&data, ts);
+                    }
+                    while let Ok(ts) = input_notify_rx.try_recv() {
+                        detector.on_input_sent(ts);
+                    }
+                    if let Some(event) = detector.tick(Instant::now()) {
+                        let ts = timestamp_ms();
+                        if let Err(e) = client.send_attention(event.kind, ts, event.context).await {
+                            tracing::error!("failed to send attention: {}", e);
+                        }
+                    }
                 }
-
-                // Process input notifications
-                while let Ok(ts) = input_notify_rx.try_recv() {
-                    detector.on_input_sent(ts);
-                }
-
-                // Check for attention events
-                if let Some(event) = detector.tick(Instant::now()) {
-                    let ts = timestamp_ms();
-                    if let Err(e) = client.send_attention(event.kind, ts, event.context).await {
-                        tracing::error!("failed to send attention: {}", e);
+                _ = tokio::time::sleep(Duration::from_millis(50)) => {
+                    match child.try_wait() {
+                        Ok(Some(status)) => break status,
+                        Ok(None) => continue,
+                        Err(e) => {
+                            tracing::error!("waitpid error: {}", e);
+                            break ExitStatus::Code(1);
+                        }
                     }
                 }
             }
+        }
+    };
 
-            // Check for child exit (non-blocking)
-            _ = tokio::time::sleep(Duration::from_millis(50)) => {
-                match child.try_wait() {
-                    Ok(Some(status)) => break status,
-                    Ok(None) => continue,
-                    Err(e) => {
-                        tracing::error!("waitpid error: {}", e);
-                        break ExitStatus::Code(1);
-                    }
-                }
+    #[cfg(not(feature = "attention"))]
+    let exit_status = loop {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => continue,
+            Err(e) => {
+                tracing::error!("waitpid error: {}", e);
+                break ExitStatus::Code(1);
             }
         }
     };

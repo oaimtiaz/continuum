@@ -4,6 +4,10 @@ version = "0.1.0"
 edition = "2021"
 license = "Apache-2.0"
 
+[features]
+default = ["attention"]
+attention = ["regex"]
+
 [dependencies]
 # Local crates
 continuum-pty = { path = "../continuum-pty" }
@@ -28,5 +32,5 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # Utilities
 bytes = "1.9"
-regex = "1.11"
+regex = { version = "1.11", optional = true }
 libc = "0.2"

@@ -231,7 +231,7 @@ impl ContinuumClient {
     /// Logout and clear all credentials.
     pub fn logout(&self) -> Result<(), ClientError> {
         // Storage operations happen outside block_on (main thread safe)
-        let _ = self.storage.delete("oauth_token".into());
+        let _ = self.storage.remove("oauth_token".into());
 
         self.runtime.block_on(async {
             *self.oauth_token.write().await = None;
@@ -714,7 +714,7 @@ mod tests {
             Ok(())
         }
 
-        fn delete(&self, key: String) -> Result<(), StorageError> {
+        fn remove(&self, key: String) -> Result<(), StorageError> {
             self.data.lock().unwrap().remove(&key);
             Ok(())
         }
@@ -1549,10 +1549,10 @@ mod tests {
             }
         }
 
-        fn delete(&self, key: String) -> Result<(), StorageError> {
+        fn remove(&self, key: String) -> Result<(), StorageError> {
             if self.fail_on_delete {
                 Err(StorageError::Failed {
-                    message: "Storage delete failed".to_string(),
+                    message: "Storage remove failed".to_string(),
                 })
             } else {
                 self.data.lock().unwrap().remove(&key);

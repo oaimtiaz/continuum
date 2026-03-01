@@ -32,8 +32,8 @@ pub trait SecureStorage: Send + Sync {
     /// Overwrites any existing value for the key.
     fn set(&self, key: String, value: String) -> Result<(), StorageError>;
 
-    /// Delete a value from secure storage.
+    /// Remove a value from secure storage.
     ///
     /// Returns `Ok(())` even if the key didn't exist.
-    fn delete(&self, key: String) -> Result<(), StorageError>;
+    fn remove(&self, key: String) -> Result<(), StorageError>;
 }
